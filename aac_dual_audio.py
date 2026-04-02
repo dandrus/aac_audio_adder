@@ -1,0 +1,768 @@
+#!/usr/bin/python3
+"""
+aac_dual_audio.py
+─────────────────────────────────────────────────────────────────────────────
+Radarr / Sonarr post-processing script that bakes a browser-friendly AAC
+stereo track into every media file alongside the original surround track.
+
+WHY THIS EXISTS
+───────────────
+Jellyfin browser clients streaming over a Cloudflare tunnel trigger HLS
+transcoding whenever the audio codec is not natively supported by the browser
+(e.g. EAC3 / Atmos / DTS).  Transcoding kills performance and quality.
+
+By pre-encoding a stereo AAC track and marking it as the default, the browser
+can direct-play the file.  Clients that support surround (AppleTV app, Jellyfin
+Android, etc.) can still select the original EAC3/DTS track.
+
+CALLER DETECTION
+────────────────
+Radarr sets:  radarr_moviefile_path
+Sonarr sets:  sonarr_episodefile_path
+
+MANUAL TESTING
+──────────────
+  radarr_moviefile_path=/path/to/file.mkv python3 aac_dual_audio.py
+  sonarr_episodefile_path=/path/to/episode.mkv python3 aac_dual_audio.py
+"""
+
+import json
+import logging
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION — edit these constants to match your preferences
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Bitrate for the newly created AAC track.
+# 384k is generous for 2-channel stereo; 192k is perfectly audible.
+# Browsers handle up to ~320 kbps AAC reliably.
+AAC_BITRATE: str = "384k"
+
+# Output channel count for the new AAC track.
+# 2 = stereo — the safest choice for all browsers and the Cloudflare tunnel.
+# You can set 6 for 5.1 AAC, but stereo guarantees direct-play in browsers.
+AAC_CHANNELS: int = 2
+
+# Human-readable title embedded in the new AAC track's metadata.
+# Shown in Jellyfin's audio track selector.
+AAC_TRACK_TITLE: str = "AAC 2.0 Stereo"
+
+# If True, skip files that already contain an AAC audio track.
+# Set False to force reprocessing (e.g., after changing AAC_BITRATE).
+SKIP_IF_AAC_EXISTS: bool = True
+
+# If True, keep ALL original audio tracks (dubs, commentary, etc.).
+# If False, only the selected primary surround track is kept alongside AAC.
+# Keeping all tracks is safer at the cost of slightly larger files.
+# NOTE: If False, any non-primary tracks (dubs, director's commentary, etc.)
+#       are permanently dropped from the output.  Default: True to be safe.
+PRESERVE_ALL_AUDIO: bool = True
+
+# If True, insert the new AAC track first (index 0) and mark it as default.
+# Jellyfin and most players select the first default-flagged audio track.
+# Set False to place AAC after the surround track (less common preference).
+AAC_AS_FIRST_TRACK: bool = True
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CALLER DETECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def detect_caller() -> Tuple[str, Path]:
+    """
+    Identify which *arr application called this script and return the file path.
+
+    Environment variables checked (case-insensitive on Linux, but *arr sets
+    them in lowercase):
+        radarr_moviefile_path       — set by Radarr for movie post-processing
+        sonarr_episodefile_path     — set by Sonarr for episode post-processing
+
+    Returns:
+        (app_name, Path) — e.g. ("Radarr", Path("/media/movies/..."))
+
+    Raises:
+        SystemExit(1) if neither variable is found.
+    """
+    # *arr sends eventtype=Test when the user clicks "Test" in the UI.
+    # No file path is provided — just acknowledge and exit cleanly.
+    sonarr_event = os.environ.get("sonarr_eventtype", "")
+    radarr_event = os.environ.get("radarr_eventtype", "")
+    if sonarr_event.lower() == "test" or radarr_event.lower() == "test":
+        log.info("Test event received — configuration OK.")
+        sys.exit(0)
+
+    radarr_path = os.environ.get("radarr_moviefile_path")
+    sonarr_path = os.environ.get("sonarr_episodefile_path")
+
+    if radarr_path:
+        log.info("Invoked by: Radarr")
+        return "Radarr", Path(radarr_path)
+
+    if sonarr_path:
+        log.info("Invoked by: Sonarr")
+        return "Sonarr", Path(sonarr_path)
+
+    log.error(
+        "No recognized environment variable found.\n"
+        "  Expected: radarr_moviefile_path  (Radarr)\n"
+        "         or sonarr_episodefile_path (Sonarr)\n"
+        "\n"
+        "  For manual testing:\n"
+        "    radarr_moviefile_path=/path/to/file.mkv python3 aac_dual_audio.py"
+    )
+    sys.exit(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FFPROBE HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def probe_file(file_path: Path) -> Dict[str, Any]:
+    """
+    Run ffprobe on *file_path* and return the parsed JSON output.
+
+    Uses JSON output mode rather than text parsing to avoid fragility with
+    unusual codec names, special characters in titles, etc.
+
+    Raises:
+        subprocess.CalledProcessError  if ffprobe exits non-zero
+        FileNotFoundError              if ffprobe is not installed
+        json.JSONDecodeError           if output cannot be parsed
+    """
+    cmd = [
+        "ffprobe",
+        "-v", "quiet",              # suppress banner noise
+        "-print_format", "json",    # machine-readable output
+        "-show_streams",            # include all stream details
+        "-show_format",             # include container/format details
+        "-show_chapters",           # include chapter markers
+        str(file_path),
+    ]
+    log.debug("ffprobe: %s", " ".join(cmd))
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        log.error("ffprobe failed (exit %d): %s", exc.returncode, exc.stderr.strip())
+        raise
+    except FileNotFoundError:
+        log.error(
+            "ffprobe not found.  Install ffmpeg:\n"
+            "  sudo dnf install ffmpeg          # Fedora/RHEL\n"
+            "  sudo apt install ffmpeg          # Debian/Ubuntu"
+        )
+        raise
+
+    return json.loads(result.stdout)
+
+
+def get_streams_by_type(
+    probe_data: Dict[str, Any],
+    codec_type: str,
+) -> List[Dict[str, Any]]:
+    """Return all streams whose codec_type matches *codec_type*."""
+    return [
+        s for s in probe_data.get("streams", [])
+        if s.get("codec_type") == codec_type
+    ]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMMENTARY / NON-PRIMARY TRACK DETECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Keywords that strongly suggest a track is not the primary program audio.
+# Matched case-insensitively as substrings against the track title and
+# handler_name metadata tags.
+#
+# HEURISTIC RATIONALE:
+#   • "commentary" / "comment"   — director/cast commentary tracks
+#   • "director"                 — director's commentary (common on BDs)
+#   • "interview" / "featurette" — bonus content
+#   • "making of" / "behind"     — behind-the-scenes audio
+#   • "alternate"                — alternate cut or score tracks
+#   • "descriptive" / "description" / "dvs" — audio description for accessibility
+#     (these are genuine primary-language tracks but rarely wanted as default)
+#
+# FALSE POSITIVE RISK: A film named "Commentary on War" would be mis-flagged.
+# The code falls back to the first track if everything is flagged, so this
+# cannot cause a total failure — just a suboptimal primary selection.
+_COMMENTARY_KEYWORDS: Tuple[str, ...] = (
+    "commentary",
+    "comment",
+    "director",
+    "interview",
+    "making of",
+    "behind the scenes",
+    "featurette",
+    "alternate",
+    "descriptive",
+    "description",
+    "dvs",        # Descriptive Video Service (US broadcast audio description)
+    "ad track",   # Audio Description track abbreviation
+)
+
+
+def is_commentary(stream: Dict[str, Any]) -> bool:
+    """
+    Heuristic: return True if this audio stream appears to be a commentary,
+    audio-description, or other non-primary track.
+
+    Detection rules (checked in priority order):
+      1. ffprobe reports disposition.comment == 1  (encoder-set flag; most reliable)
+      2. The track's title tag contains a keyword from _COMMENTARY_KEYWORDS
+      3. The track's handler_name tag contains a keyword (less reliable)
+
+    Returns False (not commentary) when uncertain — it is better to include
+    a commentary track as the primary source than to reject all tracks.
+    """
+    # Rule 1: disposition flag — set by authoring tools for commentary tracks.
+    if stream.get("disposition", {}).get("comment", 0) == 1:
+        return True
+
+    tags = stream.get("tags", {})
+    # Prefer uppercase fallback keys — MKV and MP4 can store tags either way.
+    title = (
+        tags.get("title") or tags.get("TITLE") or ""
+    ).lower()
+    handler = (
+        tags.get("handler_name") or tags.get("HANDLER_NAME") or ""
+    ).lower()
+
+    # Rule 2 & 3: keyword matching.
+    return any(kw in title or kw in handler for kw in _COMMENTARY_KEYWORDS)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PRIMARY AUDIO SELECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Codec preference order when multiple non-commentary tracks exist.
+# Lower index = preferred source for AAC transcoding.
+# Lossless/high-bitrate formats produce the best AAC result.
+#
+# NOTE: ffprobe reports DTS-HD MA and DTS:X as codec_name="dts"; they are
+# differentiated by the "profile" field and ranked at the top in
+# codec_quality_rank() below.
+_CODEC_PREFERENCE: List[str] = [
+    "truehd",       # Dolby TrueHD (lossless, may include Atmos object layer)
+    "dts",          # DTS — rank refined by profile in codec_quality_rank()
+    "flac",         # Lossless PCM-based (rare in Blu-ray rips but possible)
+    "eac3",         # Dolby Digital Plus / E-AC-3 (Atmos lossy core)
+    "ac3",          # Dolby Digital / AC-3 (5.1 @ up to 640 kbps)
+    "aac",          # AAC (already present; handled by SKIP_IF_AAC_EXISTS)
+    "mp3",
+    "vorbis",
+    "opus",
+    "pcm_s24le",
+    "pcm_s16le",
+]
+
+# DTS profiles that indicate lossless or near-lossless quality.
+# ffprobe populates stream["profile"] with these strings.
+_DTS_LOSSLESS_PROFILES: frozenset = frozenset({"DTS-HD MA", "DTS:X", "DTS-HD HRA"})
+
+
+def codec_quality_rank(stream: Dict[str, Any]) -> int:
+    """
+    Return a quality rank for *stream* (lower = better = preferred source).
+
+    DTS-HD MA / DTS:X streams are promoted to rank 0 (same as TrueHD)
+    because they are effectively lossless.  Standard DTS falls in its
+    natural _CODEC_PREFERENCE position.
+    """
+    codec = stream.get("codec_name", "").lower()
+    profile = stream.get("profile", "")
+
+    if codec == "dts" and profile in _DTS_LOSSLESS_PROFILES:
+        return 0  # Promote lossless DTS to top rank
+
+    try:
+        return _CODEC_PREFERENCE.index(codec) + 1
+    except ValueError:
+        return len(_CODEC_PREFERENCE) + 1  # Unknown codec → lowest priority
+
+
+def has_aac_track(audio_streams: List[Dict[str, Any]]) -> bool:
+    """Return True if any audio stream uses the AAC codec."""
+    return any(
+        s.get("codec_name", "").lower() == "aac"
+        for s in audio_streams
+    )
+
+
+def select_primary_audio(
+    audio_streams: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Choose the best audio stream to:
+      (a) transcode into the new AAC track, and
+      (b) preserve as-is as the surround track.
+
+    Selection algorithm:
+      1. Filter out commentary tracks via is_commentary().
+      2. If all tracks are flagged commentary, fall back to all tracks
+         and log a warning (better to pick something than nothing).
+      3. Among candidates, prefer English-language tracks.
+         Falls back to all candidates if no English track is found.
+      4. Among candidates, prefer any stream with disposition.default == 1.
+         Encoders typically flag the primary language track as default.
+      5. Among remaining ties, sort by codec_quality_rank() ascending.
+      6. Return the first (highest quality, non-commentary, English-preferred) track.
+
+    Returns None only if audio_streams is empty.
+    """
+    if not audio_streams:
+        return None
+
+    # Step 1: exclude commentary tracks.
+    candidates = [s for s in audio_streams if not is_commentary(s)]
+
+    # Step 2: full fallback.
+    if not candidates:
+        log.warning(
+            "All %d audio track(s) detected as commentary — "
+            "using first track as fallback primary.",
+            len(audio_streams),
+        )
+        candidates = list(audio_streams)
+
+    # Step 3: prefer English tracks.
+    _ENGLISH_TAGS: frozenset = frozenset({"eng", "en", "english"})
+    english = [
+        s for s in candidates
+        if (s.get("tags", {}).get("language") or s.get("tags", {}).get("LANGUAGE") or "").lower()
+        in _ENGLISH_TAGS
+    ]
+    if english:
+        candidates = english
+    else:
+        log.warning("No English audio track found — using best available track.")
+
+    # Step 4: prefer tracks flagged as default by the encoder.
+    default_flagged = [
+        s for s in candidates
+        if s.get("disposition", {}).get("default", 0) == 1
+    ]
+    if default_flagged:
+        candidates = default_flagged
+
+    # Step 5: sort by codec quality (ascending rank = better).
+    candidates.sort(key=codec_quality_rank)
+
+    selected = candidates[0]
+    tags = selected.get("tags", {})
+    title = tags.get("title") or tags.get("TITLE") or "(no title)"
+    log.info(
+        "Primary audio selected — index: %d | codec: %s | profile: %s | "
+        "channels: %s | language: %s | title: %r",
+        selected["index"],
+        selected.get("codec_name", "?"),
+        selected.get("profile", "?"),
+        selected.get("channels", "?"),
+        tags.get("language") or tags.get("LANGUAGE") or "?",
+        title,
+    )
+    return selected
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FFMPEG COMMAND BUILDER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_ffmpeg_command(
+    input_path: Path,
+    output_path: Path,
+    probe_data: Dict[str, Any],
+    primary_audio: Dict[str, Any],
+) -> List[str]:
+    """
+    Build and return the ffmpeg command list that produces the dual-audio file.
+
+    OUTPUT STREAM ORDER (when AAC_AS_FIRST_TRACK=True, PRESERVE_ALL_AUDIO=True):
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │  [video 0..N]   stream copy — never re-encoded                       │
+    │  [audio 0]      NEW AAC stereo — transcoded from primary_audio       │
+    │  [audio 1]      original primary surround — stream copy              │
+    │  [audio 2..M]   other original audio tracks — stream copy (if kept)  │
+    │  [subtitle 0..K] all subtitle streams — stream copy                  │
+    └──────────────────────────────────────────────────────────────────────┘
+
+    KEY TECHNIQUE: The primary audio input stream is mapped TWICE.
+      First mapping  → transcoded to AAC  (via -c:a:0 aac)
+      Second mapping → stream copied as-is (via -c:a:1 copy)
+    ffmpeg fully supports mapping the same input stream to multiple output
+    streams with different processing.
+
+    SUBTITLES: Mapped explicitly to avoid accidental loss.  Note that some
+    subtitle formats (ASS/SSA, SRT) cannot be stored in MP4 containers —
+    ffmpeg will emit an error if the output container doesn't support them.
+    MKV supports all common subtitle formats.
+
+    DATA STREAMS: Deliberately excluded.  Timecode tracks and other data
+    streams are rarely meaningful and can cause muxing errors.
+    """
+    all_audio   = get_streams_by_type(probe_data, "audio")
+    all_video   = get_streams_by_type(probe_data, "video")
+    all_subs    = get_streams_by_type(probe_data, "subtitle")
+
+    primary_abs_idx = primary_audio["index"]  # absolute stream index in the file
+
+    # All audio streams except the chosen primary (to avoid double-mapping confusion)
+    other_audio = [s for s in all_audio if s["index"] != primary_abs_idx]
+
+    # ── Base command ───────────────────────────────────────────────────────────
+    cmd: List[str] = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "warning",   # suppress verbose progress; use "info" to debug
+        "-i", str(input_path),
+    ]
+
+    # ── Stream mapping — VIDEO ─────────────────────────────────────────────────
+    # Map every video stream explicitly using its absolute index.
+    # This preserves multi-angle discs and dual-video files correctly.
+    for vs in all_video:
+        cmd += ["-map", f"0:{vs['index']}"]
+
+    # ── Stream mapping — AUDIO ─────────────────────────────────────────────────
+    # We map primary_audio TWICE:
+    #   pass 1 → will receive -c:a:<N> aac  (new AAC track)
+    #   pass 2 → will receive -c:a:<N> copy (original surround preserved)
+    if AAC_AS_FIRST_TRACK:
+        cmd += ["-map", f"0:{primary_abs_idx}"]   # output audio 0 → new AAC
+        cmd += ["-map", f"0:{primary_abs_idx}"]   # output audio 1 → surround copy
+        if PRESERVE_ALL_AUDIO:
+            for oa in other_audio:
+                cmd += ["-map", f"0:{oa['index']}"]   # output audio 2+ → copy
+    else:
+        cmd += ["-map", f"0:{primary_abs_idx}"]   # output audio 0 → surround copy
+        cmd += ["-map", f"0:{primary_abs_idx}"]   # output audio 1 → new AAC
+        if PRESERVE_ALL_AUDIO:
+            for oa in other_audio:
+                cmd += ["-map", f"0:{oa['index']}"]   # output audio 2+ → copy
+
+    # ── Stream mapping — SUBTITLES ─────────────────────────────────────────────
+    for ss in all_subs:
+        cmd += ["-map", f"0:{ss['index']}"]
+
+    # ── Codec: VIDEO ───────────────────────────────────────────────────────────
+    # Always copy — no video re-encoding under any circumstances.
+    cmd += ["-c:v", "copy"]
+
+    # ── Codec: AUDIO ───────────────────────────────────────────────────────────
+    # Output audio stream indices are 0-based within the audio type.
+    # -c:a:N sets the codec for output audio stream N.
+    # -b:a:N sets the bitrate for output audio stream N.
+    # -ac:a:N sets the channel count for output audio stream N.
+    n_other = len(other_audio) if PRESERVE_ALL_AUDIO else 0
+
+    if AAC_AS_FIRST_TRACK:
+        aac_out_idx      = 0
+        surround_out_idx = 1
+    else:
+        surround_out_idx = 0
+        aac_out_idx      = 1
+    other_start_idx = 2   # other tracks always start at index 2
+
+    # New AAC track: transcode with downmix to AAC_CHANNELS channels.
+    # ffmpeg's built-in matrix downmix is used; no explicit pan filter needed.
+    cmd += [f"-c:a:{aac_out_idx}",  "aac"]
+    cmd += [f"-b:a:{aac_out_idx}",  AAC_BITRATE]
+    cmd += [f"-ac:a:{aac_out_idx}", str(AAC_CHANNELS)]
+
+    # Original surround track: stream copy (no quality loss).
+    cmd += [f"-c:a:{surround_out_idx}", "copy"]
+
+    # Other audio tracks: stream copy.
+    for i in range(n_other):
+        cmd += [f"-c:a:{other_start_idx + i}", "copy"]
+
+    # ── Codec: SUBTITLES ───────────────────────────────────────────────────────
+    cmd += ["-c:s", "copy"]
+
+    # ── Disposition flags ──────────────────────────────────────────────────────
+    # Mark the AAC track as the ONLY default audio track.
+    # Jellyfin's web player selects the first default-flagged audio stream.
+    # Clear default on everything else to prevent ambiguity.
+    cmd += [f"-disposition:a:{aac_out_idx}",      "default"]
+    cmd += [f"-disposition:a:{surround_out_idx}", "0"]
+    for i in range(n_other):
+        cmd += [f"-disposition:a:{other_start_idx + i}", "0"]
+
+    # ── Metadata for the new AAC track ─────────────────────────────────────────
+    cmd += [f"-metadata:s:a:{aac_out_idx}", f"title={AAC_TRACK_TITLE}"]
+
+    # Copy language tag from the primary source if available.
+    primary_tags = primary_audio.get("tags") or {}
+    lang = primary_tags.get("language") or primary_tags.get("LANGUAGE")
+    if lang:
+        cmd += [f"-metadata:s:a:{aac_out_idx}", f"language={lang}"]
+
+    # ── Container-level metadata and chapters ──────────────────────────────────
+    # -map_metadata 0  → copy all container tags (title, year, comment, etc.)
+    # -map_chapters 0  → copy chapter markers from input
+    cmd += ["-map_metadata", "0"]
+    cmd += ["-map_chapters",  "0"]
+
+    # ── Output ─────────────────────────────────────────────────────────────────
+    # -y: overwrite the temp file if it somehow already exists.
+    cmd += ["-y", str(output_path)]
+
+    return cmd
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# OUTPUT VALIDATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def validate_output(output_path: Path, input_path: Path) -> bool:
+    """
+    Sanity-check the output file before replacing the original.
+
+    Checks:
+      1. File exists and is non-empty.
+      2. File is at least 90% the size of the input.  The output should
+         actually be LARGER (new AAC track added), so < 90% strongly suggests
+         truncation or silent ffmpeg failure.
+      3. ffprobe can parse the file without errors.
+
+    Returns True if all checks pass, False otherwise.
+    """
+    if not output_path.exists():
+        log.error("Validation failed: output file does not exist: %s", output_path)
+        return False
+
+    out_size = output_path.stat().st_size
+    in_size  = input_path.stat().st_size
+
+    if out_size == 0:
+        log.error("Validation failed: output file is empty")
+        return False
+
+    size_ratio = out_size / in_size
+    if size_ratio < 0.90:
+        # Not a hard failure on its own; ffprobe catch real corruption below.
+        log.warning(
+            "Output is only %.1f%% of input size (%d vs %d bytes) — "
+            "possible truncation.",
+            size_ratio * 100, out_size, in_size,
+        )
+
+    try:
+        probe_file(output_path)
+    except Exception as exc:
+        log.error("Validation failed: ffprobe rejected output file: %s", exc)
+        return False
+
+    log.info(
+        "Output validation passed — size: %.1f MB (%.1f%% of input)",
+        out_size / 1e6, size_ratio * 100,
+    )
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEMP FILE CLEANUP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def cleanup_temp(tmp_path: Path) -> None:
+    """Remove *tmp_path* if it exists.  Log but do not raise on failure."""
+    if tmp_path.exists():
+        try:
+            tmp_path.unlink()
+            log.debug("Cleaned up temp file: %s", tmp_path)
+        except OSError as exc:
+            log.warning("Could not remove temp file %s: %s", tmp_path, exc)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN PROCESSING PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def process_file(file_path: Path) -> bool:
+    """
+    Full dual-audio processing pipeline for a single media file.
+
+    Pipeline:
+      1. Validate input path.
+      2. Probe file with ffprobe.
+      3. Check for existing AAC track (skip if SKIP_IF_AAC_EXISTS).
+      4. Select the best primary audio stream.
+      5. Build the ffmpeg command.
+      6. Run ffmpeg into a temp file in the same directory.
+      7. Validate the temp output.
+      8. Atomically replace the original with the temp file.
+
+    SAFETY GUARANTEE: The original file is NEVER modified unless steps 1–7
+    all succeed.  On any failure, the temp file is deleted and the function
+    returns False.
+
+    Returns:
+        True  — file was processed successfully, or was deliberately skipped.
+        False — processing failed; original file is intact.
+    """
+    log.info("─" * 60)
+    log.info("Processing: %s", file_path)
+
+    # ── Step 1: Input validation ───────────────────────────────────────────────
+    if not file_path.exists():
+        log.error("Input file not found: %s", file_path)
+        return False
+    if not file_path.is_file():
+        log.error("Input path is not a regular file: %s", file_path)
+        return False
+
+    # ── Step 2: Probe ──────────────────────────────────────────────────────────
+    try:
+        probe_data = probe_file(file_path)
+    except Exception:
+        log.error("Failed to probe input file. Aborting.")
+        return False
+
+    audio_streams    = get_streams_by_type(probe_data, "audio")
+    video_streams    = get_streams_by_type(probe_data, "video")
+    subtitle_streams = get_streams_by_type(probe_data, "subtitle")
+
+    log.info(
+        "Stream summary — video: %d | audio: %d | subtitles: %d",
+        len(video_streams), len(audio_streams), len(subtitle_streams),
+    )
+    for s in audio_streams:
+        tags = s.get("tags", {})
+        log.info(
+            "  Audio [%d] codec=%-8s channels=%-2s lang=%-4s default=%-1s title=%r",
+            s["index"],
+            s.get("codec_name", "?"),
+            s.get("channels", "?"),
+            tags.get("language") or tags.get("LANGUAGE") or "?",
+            s.get("disposition", {}).get("default", 0),
+            tags.get("title") or tags.get("TITLE") or "",
+        )
+
+    if not audio_streams:
+        log.warning("No audio streams found — nothing to do.")
+        return True  # Not a processing error
+
+    # ── Step 3: AAC check ──────────────────────────────────────────────────────
+    if SKIP_IF_AAC_EXISTS and has_aac_track(audio_streams):
+        log.info("File already has an AAC track — skipping (SKIP_IF_AAC_EXISTS=True).")
+        return True
+
+    # ── Step 4: Select primary audio ───────────────────────────────────────────
+    primary_audio = select_primary_audio(audio_streams)
+    if primary_audio is None:
+        log.error("Could not select a primary audio stream.")
+        return False
+
+    # ── Step 5: Build ffmpeg command ───────────────────────────────────────────
+    # Place the temp file next to the original so the final os.replace() is
+    # an atomic rename on the same filesystem (no cross-device copy).
+    output_dir = file_path.parent
+    tmp_path   = output_dir / (file_path.stem + ".__aac_tmp__" + file_path.suffix)
+
+    cmd = build_ffmpeg_command(file_path, tmp_path, probe_data, primary_audio)
+    log.debug("ffmpeg command:\n  %s", "\n  ".join(cmd))
+
+    # ── Step 6: Run ffmpeg ─────────────────────────────────────────────────────
+    log.info("Running ffmpeg … (this may take several minutes)")
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        log.error(
+            "ffmpeg not found.  Install it:\n"
+            "  sudo dnf install ffmpeg   # Fedora/RHEL\n"
+            "  sudo apt install ffmpeg   # Debian/Ubuntu"
+        )
+        cleanup_temp(tmp_path)
+        return False
+    except Exception as exc:
+        log.error("Unexpected error running ffmpeg: %s", exc)
+        cleanup_temp(tmp_path)
+        return False
+
+    if result.returncode != 0:
+        log.error(
+            "ffmpeg exited with code %d.\nstderr:\n%s",
+            result.returncode, result.stderr.strip()
+        )
+        cleanup_temp(tmp_path)
+        return False
+
+    # Log any ffmpeg warnings even on success (useful for subtitle issues, etc.)
+    if result.stderr.strip():
+        log.debug("ffmpeg stderr:\n%s", result.stderr.strip())
+
+    log.info("ffmpeg finished successfully.")
+
+    # ── Step 7: Validate output ────────────────────────────────────────────────
+    if not validate_output(tmp_path, file_path):
+        log.error("Output validation failed — original file is untouched.")
+        cleanup_temp(tmp_path)
+        return False
+
+    # ── Step 8: Atomic replace ─────────────────────────────────────────────────
+    # os.replace() is POSIX-atomic when src and dst are on the same filesystem.
+    # The original file is replaced in a single syscall — no window where
+    # both or neither file exists.
+    log.info("Replacing original with processed output …")
+    try:
+        os.replace(str(tmp_path), str(file_path))
+    except OSError as exc:
+        log.error("Failed to replace original file: %s", exc)
+        cleanup_temp(tmp_path)
+        return False
+
+    log.info("SUCCESS: %s", file_path)
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    log.info("╔══ AAC Dual-Audio Post-Processor ══╗")
+
+    app_name, file_path = detect_caller()
+    log.info("Application : %s", app_name)
+    log.info("Target file : %s", file_path)
+
+    success = process_file(file_path)
+
+    if not success:
+        log.error("Processing FAILED — see messages above.")
+        sys.exit(1)
+
+    log.info("Processing COMPLETE.")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

@@ -487,18 +487,31 @@ def build_ffmpeg_command(
         aac_out_idx      = 1
     other_start_idx = 2   # other tracks always start at index 2
 
+    # MP4/M4V containers use the ipod muxer, which only accepts AAC and AC3.
+    # DTS, EAC3, TrueHD, etc. cannot be stream-copied into these containers.
+    # Transcode non-AAC audio to AC3 when the output is an MP4-family file.
+    _MP4_CONTAINERS = frozenset({".mp4", ".m4v"})
+    if output_path.suffix.lower() in _MP4_CONTAINERS:
+        surround_codec = "ac3"
+        log.info(
+            "MP4/M4V container detected — surround track will be transcoded "
+            "to AC3 (ipod muxer does not support stream-copy of DTS/EAC3/TrueHD)."
+        )
+    else:
+        surround_codec = "copy"
+
     # New AAC track: transcode with downmix to AAC_CHANNELS channels.
     # ffmpeg's built-in matrix downmix is used; no explicit pan filter needed.
     cmd += [f"-c:a:{aac_out_idx}",  "aac"]
     cmd += [f"-b:a:{aac_out_idx}",  AAC_BITRATE]
     cmd += [f"-ac:a:{aac_out_idx}", str(AAC_CHANNELS)]
 
-    # Original surround track: stream copy (no quality loss).
-    cmd += [f"-c:a:{surround_out_idx}", "copy"]
+    # Original surround track: stream copy, or AC3 transcode for MP4 containers.
+    cmd += [f"-c:a:{surround_out_idx}", surround_codec]
 
-    # Other audio tracks: stream copy.
+    # Other audio tracks: same container-aware codec choice.
     for i in range(n_other):
-        cmd += [f"-c:a:{other_start_idx + i}", "copy"]
+        cmd += [f"-c:a:{other_start_idx + i}", surround_codec]
 
     # ── Codec: SUBTITLES ───────────────────────────────────────────────────────
     cmd += ["-c:s", "copy"]
@@ -529,6 +542,11 @@ def build_ffmpeg_command(
 
     # ── Output ─────────────────────────────────────────────────────────────────
     # -y: overwrite the temp file if it somehow already exists.
+    # -f mp4: for .mp4/.m4v outputs, force the standard mp4 muxer instead of
+    # ffmpeg's default ipod muxer.  The ipod muxer rejects HEVC video and
+    # non-AAC/MP3 audio (e.g. DTS, EAC3, TrueHD); standard mp4 accepts both.
+    if output_path.suffix.lower() in _MP4_CONTAINERS:
+        cmd += ["-f", "mp4"]
     cmd += ["-y", str(output_path)]
 
     return cmd

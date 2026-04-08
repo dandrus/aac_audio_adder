@@ -305,12 +305,31 @@ def codec_quality_rank(stream: Dict[str, Any]) -> int:
         return len(_CODEC_PREFERENCE) + 1  # Unknown codec → lowest priority
 
 
-def has_aac_track(audio_streams: List[Dict[str, Any]]) -> bool:
-    """Return True if any audio stream uses the AAC codec."""
-    return any(
-        s.get("codec_name", "").lower() == "aac"
-        for s in audio_streams
-    )
+def has_english_aac_track(audio_streams: List[Dict[str, Any]]) -> bool:
+    """
+    Return True if a non-commentary English AAC track already exists.
+
+    Matches on either:
+      • Language tag is English ("eng", "en", "english"), OR
+      • Track title matches AAC_TRACK_TITLE — catches tracks we injected on a
+        prior run when the source had no language tag (so we never set one).
+
+    Foreign-language dub AAC tracks (e.g. Turkish, Czech, Hungarian) are
+    ignored — their presence does not mean the file is ready for Jellyfin
+    browser direct-play.
+    """
+    _ENGLISH_TAGS: frozenset = frozenset({"eng", "en", "english"})
+    for s in audio_streams:
+        if s.get("codec_name", "").lower() != "aac":
+            continue
+        if is_commentary(s):
+            continue
+        tags = s.get("tags", {})
+        lang  = (tags.get("language") or tags.get("LANGUAGE") or "").lower()
+        title = tags.get("title") or tags.get("TITLE") or ""
+        if lang in _ENGLISH_TAGS or title == AAC_TRACK_TITLE:
+            return True
+    return False
 
 
 def select_primary_audio(
@@ -356,18 +375,26 @@ def select_primary_audio(
         if (s.get("tags", {}).get("language") or s.get("tags", {}).get("LANGUAGE") or "").lower()
         in _ENGLISH_TAGS
     ]
-    if english:
+    found_english = bool(english)
+    if found_english:
         candidates = english
     else:
-        log.warning("No English audio track found — using best available track.")
+        log.warning(
+            "No English audio track found — selecting by codec quality only "
+            "(ignoring disposition.default to avoid picking a foreign-language dub)."
+        )
 
     # Step 4: prefer tracks flagged as default by the encoder.
-    default_flagged = [
-        s for s in candidates
-        if s.get("disposition", {}).get("default", 0) == 1
-    ]
-    if default_flagged:
-        candidates = default_flagged
+    # Only apply when English tracks were found.  If no English was detected,
+    # the default flag may point to a non-English (e.g. foreign dub) track —
+    # skipping this step prevents blindly picking the wrong language.
+    if found_english:
+        default_flagged = [
+            s for s in candidates
+            if s.get("disposition", {}).get("default", 0) == 1
+        ]
+        if default_flagged:
+            candidates = default_flagged
 
     # Step 5: sort by codec quality (ascending rank = better).
     candidates.sort(key=codec_quality_rank)
@@ -426,11 +453,28 @@ def build_ffmpeg_command(
     """
     all_audio   = get_streams_by_type(probe_data, "audio")
     all_video   = get_streams_by_type(probe_data, "video")
-    all_subs    = get_streams_by_type(probe_data, "subtitle")
+    raw_subs    = get_streams_by_type(probe_data, "subtitle")
+
+    # Filter out subtitle streams with no recognized codec — they cause the
+    # matroska muxer to fail with "Subtitle codec 0 is not supported".
+    # Streams where ffprobe returns an empty, "none", or "unknown" codec_name
+    # cannot be stream-copied and will prevent the output file header from writing.
+    _BAD_SUBTITLE_CODECS: frozenset = frozenset({"", "none", "unknown", "data"})
+    all_subs = []
+    for ss in raw_subs:
+        cname = ss.get("codec_name", "").lower()
+        if cname in _BAD_SUBTITLE_CODECS:
+            log.warning(
+                "Skipping subtitle stream %d (codec=%r) — unrecognized codec "
+                "cannot be muxed into output container.",
+                ss["index"], ss.get("codec_name", ""),
+            )
+        else:
+            all_subs.append(ss)
 
     primary_abs_idx = primary_audio["index"]  # absolute stream index in the file
 
-    # All audio streams except the chosen primary (to avoid double-mapping confusion)
+    # All audio streams except the chosen primary
     other_audio = [s for s in all_audio if s["index"] != primary_abs_idx]
 
     # ── Base command ───────────────────────────────────────────────────────────
@@ -438,6 +482,10 @@ def build_ffmpeg_command(
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "warning",   # suppress verbose progress; use "info" to debug
+        # Increase probe limits so ffmpeg can resolve PGS subtitle parameters
+        # ("unspecified size" errors) without falling back to "codec 0".
+        "-probesize", "100M",
+        "-analyzeduration", "100M",
         "-i", str(input_path),
     ]
 
@@ -471,6 +519,19 @@ def build_ffmpeg_command(
     # ── Codec: VIDEO ───────────────────────────────────────────────────────────
     # Always copy — no video re-encoding under any circumstances.
     cmd += ["-c:v", "copy"]
+
+    # HEVC streams muxed by some tools (e.g. mkvmerge 96.x) contain malformed
+    # HVCC codec private data.  ffmpeg 7.x's matroska muxer calls
+    # ff_isom_write_hvcc() to write the output CodecPrivate element; if the
+    # input HVCC is invalid it returns AVERROR_INVALIDDATA and the header write
+    # fails before a single frame is processed.
+    #
+    # hevc_mp4toannexb converts the compact HVCC extradata to inline Annex B
+    # parameter sets.  ffmpeg's MKV muxer then reconstructs a valid HVCC from
+    # the Annex B data, bypassing the malformed original entirely.
+    _has_hevc = any(vs.get("codec_name", "").lower() == "hevc" for vs in all_video)
+    if _has_hevc:
+        cmd += ["-bsf:v", "hevc_mp4toannexb"]
 
     # ── Codec: AUDIO ───────────────────────────────────────────────────────────
     # Output audio stream indices are 0-based within the audio type.
@@ -685,8 +746,10 @@ def process_file(file_path: Path) -> bool:
         return True  # Not a processing error
 
     # ── Step 3: AAC check ──────────────────────────────────────────────────────
-    if SKIP_IF_AAC_EXISTS and has_aac_track(audio_streams):
-        log.info("File already has an AAC track — skipping (SKIP_IF_AAC_EXISTS=True).")
+    if SKIP_IF_AAC_EXISTS and has_english_aac_track(audio_streams):
+        log.info(
+            "File already has an English AAC track — skipping (SKIP_IF_AAC_EXISTS=True)."
+        )
         return True
 
     # ── Step 4: Select primary audio ───────────────────────────────────────────

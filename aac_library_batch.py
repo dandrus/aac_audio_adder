@@ -59,7 +59,7 @@ try:
     from aac_dual_audio import (
         probe_file,
         get_streams_by_type,
-        has_aac_track,
+        has_english_aac_track,
         process_file,
         SKIP_IF_AAC_EXISTS,
     )
@@ -195,7 +195,7 @@ def needs_processing(file_path: Path) -> bool:
     try:
         probe_data    = probe_file(file_path)
         audio_streams = get_streams_by_type(probe_data, "audio")
-        return not has_aac_track(audio_streams)
+        return not has_english_aac_track(audio_streams)
     except Exception as exc:
         log.warning("Could not probe %s (%s) — will attempt processing anyway.", file_path, exc)
         return True

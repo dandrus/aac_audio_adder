@@ -321,9 +321,11 @@ def codec_quality_rank(stream: Dict[str, Any]) -> int:
         return len(_CODEC_PREFERENCE) + 1  # Unknown codec → lowest priority
 
 
-def has_english_aac_track(audio_streams: List[Dict[str, Any]]) -> bool:
+def find_english_aac_track(
+    audio_streams: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
     """
-    Return True if a non-commentary English AAC track already exists.
+    Return the first non-commentary English AAC track, or None.
 
     Matches on either:
       • Language tag is English ("eng", "en", "english"), OR
@@ -344,8 +346,35 @@ def has_english_aac_track(audio_streams: List[Dict[str, Any]]) -> bool:
         lang  = (tags.get("language") or tags.get("LANGUAGE") or "").lower()
         title = tags.get("title") or tags.get("TITLE") or ""
         if lang in _ENGLISH_TAGS or title == AAC_TRACK_TITLE:
-            return True
-    return False
+            return s
+    return None
+
+
+def has_english_aac_track(audio_streams: List[Dict[str, Any]]) -> bool:
+    """Return True if a non-commentary English AAC track already exists."""
+    return find_english_aac_track(audio_streams) is not None
+
+
+def audio_dispositions_correct(
+    audio_streams: List[Dict[str, Any]],
+    aac_stream: Dict[str, Any],
+) -> bool:
+    """
+    Return True if *aac_stream* is the ONLY audio track flagged default.
+
+    Files that ship with an English AAC track already baked in often carry
+    wrong flags from the source (e.g. a foreign dub flagged default), which
+    makes Jellyfin pick the wrong track.  Such files are skipped by the AAC
+    check but still need a disposition-only fix.
+    """
+    if aac_stream.get("disposition", {}).get("default", 0) != 1:
+        return False
+    for s in audio_streams:
+        if s["index"] == aac_stream["index"]:
+            continue
+        if s.get("disposition", {}).get("default", 0) == 1:
+            return False
+    return True
 
 
 def select_primary_audio(
@@ -509,9 +538,18 @@ def build_ffmpeg_command(
     output_path: Path,
     probe_data: Dict[str, Any],
     primary_audio: Dict[str, Any],
+    fix_dispositions_only: bool = False,
 ) -> List[str]:
     """
     Build and return the ffmpeg command list that produces the dual-audio file.
+
+    FIX-ONLY MODE (fix_dispositions_only=True): used when the file already
+    contains an English AAC track (passed as *primary_audio*) but the default
+    flags are wrong (e.g. a foreign dub flagged default by the source).
+    Every stream is copied — no transcoding — with the AAC track mapped first,
+    flagged as the only default audio, and the subtitle default logic applied.
+    Existing track metadata (title, language) is left untouched.  All audio
+    tracks are always kept regardless of PRESERVE_ALL_AUDIO.
 
     OUTPUT STREAM ORDER (when AAC_AS_FIRST_TRACK=True, PRESERVE_ALL_AUDIO=True):
     ┌──────────────────────────────────────────────────────────────────────┐
@@ -597,10 +635,16 @@ def build_ffmpeg_command(
         cmd += ["-map", f"0:{vs['index']}"]
 
     # ── Stream mapping — AUDIO ─────────────────────────────────────────────────
-    # We map primary_audio TWICE:
+    # Fix-only mode: the existing AAC track (primary_audio) is mapped ONCE,
+    # first, and every other audio track follows in original order.
+    if fix_dispositions_only:
+        cmd += ["-map", f"0:{primary_abs_idx}"]       # output audio 0 → existing AAC
+        for oa in other_audio:
+            cmd += ["-map", f"0:{oa['index']}"]       # output audio 1+ → copy
+    # Normal mode: we map primary_audio TWICE:
     #   pass 1 → will receive -c:a:<N> aac  (new AAC track)
     #   pass 2 → will receive -c:a:<N> copy (original surround preserved)
-    if AAC_AS_FIRST_TRACK:
+    elif AAC_AS_FIRST_TRACK:
         cmd += ["-map", f"0:{primary_abs_idx}"]   # output audio 0 → new AAC
         cmd += ["-map", f"0:{primary_abs_idx}"]   # output audio 1 → surround copy
         if PRESERVE_ALL_AUDIO:
@@ -616,6 +660,16 @@ def build_ffmpeg_command(
     # ── Stream mapping — SUBTITLES ─────────────────────────────────────────────
     for ss in all_subs:
         cmd += ["-map", f"0:{ss['index']}"]
+
+    # ── Stream mapping — ATTACHMENTS ───────────────────────────────────────────
+    # MKV attachments carry embedded cover art and fonts for ASS/SSA subtitles;
+    # dropping them loses artwork and breaks styled-subtitle rendering.
+    # MP4-family containers don't support attachment streams, so skip there.
+    # The trailing '?' makes the mapping optional (no error when none exist).
+    _MP4_CONTAINERS = frozenset({".mp4", ".m4v"})
+    if output_path.suffix.lower() not in _MP4_CONTAINERS:
+        cmd += ["-map", "0:t?"]
+        cmd += ["-c:t", "copy"]
 
     # ── Codec: VIDEO ───────────────────────────────────────────────────────────
     # Always copy — no video re-encoding under any circumstances.
@@ -642,41 +696,48 @@ def build_ffmpeg_command(
     # -c:a:N sets the codec for output audio stream N.
     # -b:a:N sets the bitrate for output audio stream N.
     # -ac:a:N sets the channel count for output audio stream N.
-    n_other = len(other_audio) if PRESERVE_ALL_AUDIO else 0
-
-    if AAC_AS_FIRST_TRACK:
+    if fix_dispositions_only:
+        # Fix-only: existing AAC at output 0, other tracks follow.  All audio
+        # already lives in this container, so everything is pure stream copy.
+        n_other          = len(other_audio)
         aac_out_idx      = 0
-        surround_out_idx = 1
+        other_start_idx  = 1
+        cmd += ["-c:a", "copy"]
     else:
-        surround_out_idx = 0
-        aac_out_idx      = 1
-    other_start_idx = 2   # other tracks always start at index 2
+        n_other = len(other_audio) if PRESERVE_ALL_AUDIO else 0
 
-    # MP4/M4V containers use the ipod muxer, which only accepts AAC and AC3.
-    # DTS, EAC3, TrueHD, etc. cannot be stream-copied into these containers.
-    # Transcode non-AAC audio to AC3 when the output is an MP4-family file.
-    _MP4_CONTAINERS = frozenset({".mp4", ".m4v"})
-    if output_path.suffix.lower() in _MP4_CONTAINERS:
-        surround_codec = "ac3"
-        log.info(
-            "MP4/M4V container detected — surround track will be transcoded "
-            "to AC3 (ipod muxer does not support stream-copy of DTS/EAC3/TrueHD)."
-        )
-    else:
-        surround_codec = "copy"
+        if AAC_AS_FIRST_TRACK:
+            aac_out_idx      = 0
+            surround_out_idx = 1
+        else:
+            surround_out_idx = 0
+            aac_out_idx      = 1
+        other_start_idx = 2   # other tracks always start at index 2
 
-    # New AAC track: transcode with downmix to AAC_CHANNELS channels.
-    # ffmpeg's built-in matrix downmix is used; no explicit pan filter needed.
-    cmd += [f"-c:a:{aac_out_idx}",  "aac"]
-    cmd += [f"-b:a:{aac_out_idx}",  AAC_BITRATE]
-    cmd += [f"-ac:a:{aac_out_idx}", str(AAC_CHANNELS)]
+        # MP4/M4V containers use the ipod muxer, which only accepts AAC and AC3.
+        # DTS, EAC3, TrueHD, etc. cannot be stream-copied into these containers.
+        # Transcode non-AAC audio to AC3 when the output is an MP4-family file.
+        if output_path.suffix.lower() in _MP4_CONTAINERS:
+            surround_codec = "ac3"
+            log.info(
+                "MP4/M4V container detected — surround track will be transcoded "
+                "to AC3 (ipod muxer does not support stream-copy of DTS/EAC3/TrueHD)."
+            )
+        else:
+            surround_codec = "copy"
 
-    # Original surround track: stream copy, or AC3 transcode for MP4 containers.
-    cmd += [f"-c:a:{surround_out_idx}", surround_codec]
+        # New AAC track: transcode with downmix to AAC_CHANNELS channels.
+        # ffmpeg's built-in matrix downmix is used; no explicit pan filter needed.
+        cmd += [f"-c:a:{aac_out_idx}",  "aac"]
+        cmd += [f"-b:a:{aac_out_idx}",  AAC_BITRATE]
+        cmd += [f"-ac:a:{aac_out_idx}", str(AAC_CHANNELS)]
 
-    # Other audio tracks: same container-aware codec choice.
-    for i in range(n_other):
-        cmd += [f"-c:a:{other_start_idx + i}", surround_codec]
+        # Original surround track: stream copy, or AC3 transcode for MP4 containers.
+        cmd += [f"-c:a:{surround_out_idx}", surround_codec]
+
+        # Other audio tracks: same container-aware codec choice.
+        for i in range(n_other):
+            cmd += [f"-c:a:{other_start_idx + i}", surround_codec]
 
     # ── Codec: SUBTITLES ───────────────────────────────────────────────────────
     cmd += ["-c:s", "copy"]
@@ -685,10 +746,17 @@ def build_ffmpeg_command(
     # Mark the AAC track as the ONLY default audio track.
     # Jellyfin's web player selects the first default-flagged audio stream.
     # Clear default on everything else to prevent ambiguity.
-    cmd += [f"-disposition:a:{aac_out_idx}",      "default"]
-    cmd += [f"-disposition:a:{surround_out_idx}", "0"]
-    for i in range(n_other):
-        cmd += [f"-disposition:a:{other_start_idx + i}", "0"]
+    if fix_dispositions_only:
+        # +default / -default touch only the default bit — original tracks
+        # keep their other flags (comment, hearing_impaired, etc.).
+        cmd += [f"-disposition:a:{aac_out_idx}", "+default"]
+        for i in range(n_other):
+            cmd += [f"-disposition:a:{other_start_idx + i}", "-default"]
+    else:
+        cmd += [f"-disposition:a:{aac_out_idx}",      "default"]
+        cmd += [f"-disposition:a:{surround_out_idx}", "0"]
+        for i in range(n_other):
+            cmd += [f"-disposition:a:{other_start_idx + i}", "0"]
 
     # Subtitle default: flag the best English subtitle, clear default on the
     # rest.  The +default / -default forms modify ONLY the default bit, so
@@ -701,13 +769,15 @@ def build_ffmpeg_command(
                 cmd += [f"-disposition:s:{i}", flag]
 
     # ── Metadata for the new AAC track ─────────────────────────────────────────
-    cmd += [f"-metadata:s:a:{aac_out_idx}", f"title={AAC_TRACK_TITLE}"]
+    # Fix-only mode reuses an existing AAC track — leave its tags untouched.
+    if not fix_dispositions_only:
+        cmd += [f"-metadata:s:a:{aac_out_idx}", f"title={AAC_TRACK_TITLE}"]
 
-    # Copy language tag from the primary source if available.
-    primary_tags = primary_audio.get("tags") or {}
-    lang = primary_tags.get("language") or primary_tags.get("LANGUAGE")
-    if lang:
-        cmd += [f"-metadata:s:a:{aac_out_idx}", f"language={lang}"]
+        # Copy language tag from the primary source if available.
+        primary_tags = primary_audio.get("tags") or {}
+        lang = primary_tags.get("language") or primary_tags.get("LANGUAGE")
+        if lang:
+            cmd += [f"-metadata:s:a:{aac_out_idx}", f"language={lang}"]
 
     # ── Container-level metadata and chapters ──────────────────────────────────
     # -map_metadata 0  → copy all container tags (title, year, comment, etc.)
@@ -882,7 +952,9 @@ def process_file(file_path: Path) -> bool:
     Pipeline:
       1. Validate input path.
       2. Probe file with ffprobe.
-      3. Check for existing AAC track (skip if SKIP_IF_AAC_EXISTS).
+      3. Check for existing AAC track (skip if SKIP_IF_AAC_EXISTS and its
+         default flags are already correct; wrong flags trigger a
+         disposition-only stream-copy remux instead).
       4. Select the best primary audio stream.
       5. Build the ffmpeg command.
       6. Run ffmpeg (ionice/nice-wrapped) into a temp file — staged on the
@@ -942,17 +1014,37 @@ def process_file(file_path: Path) -> bool:
         return True  # Not a processing error
 
     # ── Step 3: AAC check ──────────────────────────────────────────────────────
-    if SKIP_IF_AAC_EXISTS and has_english_aac_track(audio_streams):
-        log.info(
-            "File already has an English AAC track — skipping (SKIP_IF_AAC_EXISTS=True)."
-        )
-        return True
+    # A file with an English AAC track is only truly done when that track is
+    # also the sole default — sources sometimes ship AAC pre-baked with a
+    # foreign dub flagged default, which makes Jellyfin pick the wrong track.
+    # Those get a disposition-only remux (pure stream copy, no transcoding).
+    fix_dispositions_only = False
+    existing_aac: Optional[Dict[str, Any]] = None
+    if SKIP_IF_AAC_EXISTS:
+        existing_aac = find_english_aac_track(audio_streams)
+        if existing_aac is not None:
+            if audio_dispositions_correct(audio_streams, existing_aac):
+                log.info(
+                    "File already has an English AAC track flagged default — "
+                    "skipping (SKIP_IF_AAC_EXISTS=True)."
+                )
+                return True
+            fix_dispositions_only = True
+            log.info(
+                "English AAC track exists (index %d) but audio default flags "
+                "are wrong — disposition-only remux (all streams copied, no "
+                "transcoding).",
+                existing_aac["index"],
+            )
 
     # ── Step 4: Select primary audio ───────────────────────────────────────────
-    primary_audio = select_primary_audio(audio_streams)
-    if primary_audio is None:
-        log.error("Could not select a primary audio stream.")
-        return False
+    if fix_dispositions_only:
+        primary_audio = existing_aac
+    else:
+        primary_audio = select_primary_audio(audio_streams)
+        if primary_audio is None:
+            log.error("Could not select a primary audio stream.")
+            return False
 
     # ── Step 5: Build ffmpeg command ───────────────────────────────────────────
     # Stage ffmpeg output on the NVMe (STAGING_DIR) to avoid read+write head
@@ -970,7 +1062,10 @@ def process_file(file_path: Path) -> bool:
     else:
         tmp_path = local_tmp
 
-    cmd = build_ffmpeg_command(file_path, tmp_path, probe_data, primary_audio)
+    cmd = build_ffmpeg_command(
+        file_path, tmp_path, probe_data, primary_audio,
+        fix_dispositions_only=fix_dispositions_only,
+    )
     log.debug("ffmpeg command:\n  %s", "\n  ".join(cmd))
 
     # ── Step 6: Run ffmpeg ─────────────────────────────────────────────────────

@@ -1127,6 +1127,10 @@ def process_file(file_path: Path) -> bool:
                     "File already has an English AAC track flagged default — "
                     "skipping (SKIP_IF_AAC_EXISTS=True)."
                 )
+                # Still seed the original-date sidecar so a future upgrade or
+                # reprocess of this folder can restore the right date.
+                if PRESERVE_MTIMES:
+                    seed_original_date(file_path.parent, file_path.stat().st_mtime)
                 return True
             fix_dispositions_only = True
             log.info(

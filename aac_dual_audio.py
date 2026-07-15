@@ -29,6 +29,7 @@ MANUAL TESTING
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -67,6 +68,21 @@ PRESERVE_ALL_AUDIO: bool = True
 # Jellyfin and most players select the first default-flagged audio track.
 # Set False to place AAC after the surround track (less common preference).
 AAC_AS_FIRST_TRACK: bool = True
+
+# If True, mark the best English subtitle track as default and clear the
+# default flag on every other subtitle track.  Commentary / director tracks
+# are excluded; plain dialogue subs are preferred over SDH and forced tracks.
+# If no English subtitle exists, subtitle dispositions are left untouched.
+SET_ENGLISH_SUBTITLE_DEFAULT: bool = True
+
+# Staging directory for ffmpeg temp output, on the NVMe (/mnt/mediadepot).
+# Writing the temp file on the same spinning disk as the source creates
+# sustained read+write head contention on the media pool, which stalls
+# Jellyfin playback.  The finished file is moved back to the source
+# directory afterwards in one sequential burst.
+# If this mount is missing, unwritable, or full, the script falls back to
+# the previous behavior (temp file next to the source) with a warning.
+STAGING_DIR: Path = Path("/mnt/mediadepot/aac_tmp")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -416,6 +432,75 @@ def select_primary_audio(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# DEFAULT SUBTITLE SELECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def select_default_subtitle(
+    subtitle_streams: List[Dict[str, Any]],
+) -> Optional[int]:
+    """
+    Pick which subtitle stream should carry the default flag in the output.
+
+    Returns the POSITION of the chosen stream within *subtitle_streams* —
+    which equals its output subtitle index, since subtitles are mapped in
+    list order — or None when no suitable English track exists (source
+    dispositions are then left untouched).
+
+    Selection algorithm:
+      1. Candidates must be tagged English ("eng"/"en"/"english").
+         Untagged tracks are excluded — they could be any language.
+      2. Commentary / director tracks are excluded via is_commentary()
+         (disposition.comment flag + title keyword heuristics).
+      3. Remaining candidates are ranked:
+           0 — plain dialogue subs (not forced, not SDH)
+           1 — SDH / hearing-impaired (fallback if nothing plain exists)
+           2 — forced (signs / foreign-dialogue only; last resort)
+      4. Ties broken by the source default flag, then file order.
+    """
+    _ENGLISH_TAGS: frozenset = frozenset({"eng", "en", "english"})
+
+    candidates: List[Tuple[int, int, int]] = []  # (rank, not-source-default, pos)
+    for pos, s in enumerate(subtitle_streams):
+        tags = s.get("tags", {}) or {}
+        lang = (tags.get("language") or tags.get("LANGUAGE") or "").lower()
+        if lang not in _ENGLISH_TAGS:
+            continue
+        if is_commentary(s):
+            continue
+
+        disp = s.get("disposition", {}) or {}
+        title = (tags.get("title") or tags.get("TITLE") or "").lower()
+
+        if disp.get("forced", 0) == 1 or "forced" in title:
+            rank = 2
+        elif (
+            disp.get("hearing_impaired", 0) == 1
+            or "sdh" in title
+            or "hearing impaired" in title
+        ):
+            rank = 1
+        else:
+            rank = 0
+
+        candidates.append((rank, 0 if disp.get("default", 0) == 1 else 1, pos))
+
+    if not candidates:
+        log.info("No suitable English subtitle found — leaving subtitle flags as-is.")
+        return None
+
+    best_pos = min(candidates)[2]
+    chosen = subtitle_streams[best_pos]
+    chosen_tags = chosen.get("tags", {}) or {}
+    log.info(
+        "Default subtitle selected — index: %d | codec: %s | title: %r",
+        chosen["index"],
+        chosen.get("codec_name", "?"),
+        chosen_tags.get("title") or chosen_tags.get("TITLE") or "(no title)",
+    )
+    return best_pos
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # FFMPEG COMMAND BUILDER
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -443,7 +528,10 @@ def build_ffmpeg_command(
     ffmpeg fully supports mapping the same input stream to multiple output
     streams with different processing.
 
-    SUBTITLES: Mapped explicitly to avoid accidental loss.  Note that some
+    SUBTITLES: Mapped explicitly to avoid accidental loss.  When
+    SET_ENGLISH_SUBTITLE_DEFAULT is True, the best English subtitle (per
+    select_default_subtitle) gets the default flag and all others have it
+    cleared; other disposition bits are preserved.  Note that some
     subtitle formats (ASS/SSA, SRT) cannot be stored in MP4 containers —
     ffmpeg will emit an error if the output container doesn't support them.
     MKV supports all common subtitle formats.
@@ -452,7 +540,15 @@ def build_ffmpeg_command(
     streams are rarely meaningful and can cause muxing errors.
     """
     all_audio   = get_streams_by_type(probe_data, "audio")
-    all_video   = get_streams_by_type(probe_data, "video")
+    # Exclude video streams with no valid dimensions (e.g. MJPEG attached
+    # pictures embedded by mkvmerge that ffmpeg can't fully probe).  Passing
+    # these to the matroska muxer causes "dimensions not set" / header write
+    # failure.  Streams with valid width+height (cover art with known size) are
+    # kept; only truly unresolvable streams are dropped.
+    all_video   = [
+        vs for vs in get_streams_by_type(probe_data, "video")
+        if vs.get("width", 0) > 0 and vs.get("height", 0) > 0
+    ]
     raw_subs    = get_streams_by_type(probe_data, "subtitle")
 
     # Filter out subtitle streams with no recognized codec — they cause the
@@ -486,6 +582,11 @@ def build_ffmpeg_command(
         # ("unspecified size" errors) without falling back to "codec 0".
         "-probesize", "100M",
         "-analyzeduration", "100M",
+        # Generate PTS for packets that lack timestamps where possible.
+        # NOTE: genpts only works when ffmpeg can decode to synthesise timing;
+        # it does NOT help in copy mode.  Unset-timestamp errors in copy mode
+        # are caught and reported below with a repair suggestion.
+        "-fflags", "+genpts",
         "-i", str(input_path),
     ]
 
@@ -529,9 +630,12 @@ def build_ffmpeg_command(
     # hevc_mp4toannexb converts the compact HVCC extradata to inline Annex B
     # parameter sets.  ffmpeg's MKV muxer then reconstructs a valid HVCC from
     # the Annex B data, bypassing the malformed original entirely.
-    _has_hevc = any(vs.get("codec_name", "").lower() == "hevc" for vs in all_video)
-    if _has_hevc:
-        cmd += ["-bsf:v", "hevc_mp4toannexb"]
+    # Apply hevc_mp4toannexb only to HEVC streams by their output video index.
+    # Using -bsf:v would apply to ALL video streams, including MJPEG attached
+    # pictures, which causes "Codec 'mjpeg' is not supported by hevc_mp4toannexb".
+    for _out_v_idx, _vs in enumerate(all_video):
+        if _vs.get("codec_name", "").lower() == "hevc":
+            cmd += [f"-bsf:v:{_out_v_idx}", "hevc_mp4toannexb"]
 
     # ── Codec: AUDIO ───────────────────────────────────────────────────────────
     # Output audio stream indices are 0-based within the audio type.
@@ -585,6 +689,16 @@ def build_ffmpeg_command(
     cmd += [f"-disposition:a:{surround_out_idx}", "0"]
     for i in range(n_other):
         cmd += [f"-disposition:a:{other_start_idx + i}", "0"]
+
+    # Subtitle default: flag the best English subtitle, clear default on the
+    # rest.  The +default / -default forms modify ONLY the default bit, so
+    # other flags (forced, hearing_impaired) survive on every track.
+    if SET_ENGLISH_SUBTITLE_DEFAULT and all_subs:
+        default_sub_pos = select_default_subtitle(all_subs)
+        if default_sub_pos is not None:
+            for i in range(len(all_subs)):
+                flag = "+default" if i == default_sub_pos else "-default"
+                cmd += [f"-disposition:s:{i}", flag]
 
     # ── Metadata for the new AAC track ─────────────────────────────────────────
     cmd += [f"-metadata:s:a:{aac_out_idx}", f"title={AAC_TRACK_TITLE}"]
@@ -678,6 +792,86 @@ def cleanup_temp(tmp_path: Path) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TEMP FILE STAGING & PROCESS PRIORITY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def resolve_staging_dir(input_path: Path) -> Optional[Path]:
+    """
+    Return STAGING_DIR if it is usable for staging *input_path*'s temp output,
+    otherwise None (caller falls back to in-place temp next to the source).
+
+    Usability checks:
+      1. The staging mount (STAGING_DIR's parent) exists and is a mount point —
+         guards against writing to an empty stub directory on the root disk
+         when the NVMe is not mounted.
+      2. STAGING_DIR can be created and is writable by this UID.
+      3. Free space is at least 110% of the input size (output is slightly
+         larger than input: same streams plus the new AAC track).
+    """
+    mount_root = STAGING_DIR.parent
+    if not mount_root.is_dir() or not os.path.ismount(str(mount_root)):
+        log.warning(
+            "Staging mount %s is missing or not mounted — "
+            "falling back to in-place temp file.", mount_root,
+        )
+        return None
+
+    try:
+        STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.warning(
+            "Cannot create staging dir %s (%s) — "
+            "falling back to in-place temp file.", STAGING_DIR, exc,
+        )
+        return None
+
+    if not os.access(STAGING_DIR, os.W_OK):
+        log.warning(
+            "Staging dir %s is not writable — "
+            "falling back to in-place temp file.", STAGING_DIR,
+        )
+        return None
+
+    try:
+        free = shutil.disk_usage(STAGING_DIR).free
+    except OSError as exc:
+        log.warning(
+            "Cannot check free space on %s (%s) — "
+            "falling back to in-place temp file.", STAGING_DIR, exc,
+        )
+        return None
+
+    needed = int(input_path.stat().st_size * 1.10)
+    if free < needed:
+        log.warning(
+            "Staging dir %s has insufficient free space (%.1f GB free, "
+            "%.1f GB needed) — falling back to in-place temp file.",
+            STAGING_DIR, free / 1e9, needed / 1e9,
+        )
+        return None
+
+    return STAGING_DIR
+
+
+def low_priority_prefix() -> List[str]:
+    """
+    Return an argv prefix that runs ffmpeg at idle I/O class (ionice -c 3)
+    and lowest CPU priority (nice -n 19) so it yields to Jellyfin playback.
+    Missing wrapper binaries are skipped with a warning rather than failing.
+    """
+    prefix: List[str] = []
+    if shutil.which("ionice"):
+        prefix += ["ionice", "-c", "3"]
+    else:
+        log.warning("ionice not found — ffmpeg will run at normal I/O priority.")
+    if shutil.which("nice"):
+        prefix += ["nice", "-n", "19"]
+    else:
+        log.warning("nice not found — ffmpeg will run at normal CPU priority.")
+    return prefix
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN PROCESSING PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -691,9 +885,11 @@ def process_file(file_path: Path) -> bool:
       3. Check for existing AAC track (skip if SKIP_IF_AAC_EXISTS).
       4. Select the best primary audio stream.
       5. Build the ffmpeg command.
-      6. Run ffmpeg into a temp file in the same directory.
+      6. Run ffmpeg (ionice/nice-wrapped) into a temp file — staged on the
+         NVMe (STAGING_DIR) when available, else next to the source.
       7. Validate the temp output.
-      8. Atomically replace the original with the temp file.
+      8. Move a staged temp back to the source directory, then atomically
+         replace the original.
 
     SAFETY GUARANTEE: The original file is NEVER modified unless steps 1–7
     all succeed.  On any failure, the temp file is deleted and the function
@@ -759,19 +955,30 @@ def process_file(file_path: Path) -> bool:
         return False
 
     # ── Step 5: Build ffmpeg command ───────────────────────────────────────────
-    # Place the temp file next to the original so the final os.replace() is
-    # an atomic rename on the same filesystem (no cross-device copy).
+    # Stage ffmpeg output on the NVMe (STAGING_DIR) to avoid read+write head
+    # contention on the spinning media pool while Jellyfin plays from it.
+    # The final os.replace() must be an atomic same-filesystem rename, so a
+    # staged file is first moved back into the source directory (Step 8).
+    # If staging is unavailable, fall back to the temp file next to the source.
     output_dir = file_path.parent
-    tmp_path   = output_dir / (file_path.stem + ".__aac_tmp__" + file_path.suffix)
+    local_tmp  = output_dir / (file_path.stem + ".__aac_tmp__" + file_path.suffix)
+
+    staging_dir = resolve_staging_dir(file_path)
+    if staging_dir is not None:
+        tmp_path = staging_dir / (file_path.stem + ".__aac_tmp__" + file_path.suffix)
+        log.info("Staging ffmpeg output on NVMe: %s", tmp_path)
+    else:
+        tmp_path = local_tmp
 
     cmd = build_ffmpeg_command(file_path, tmp_path, probe_data, primary_audio)
     log.debug("ffmpeg command:\n  %s", "\n  ".join(cmd))
 
     # ── Step 6: Run ffmpeg ─────────────────────────────────────────────────────
+    # Wrapped with ionice -c 3 / nice -n 19 so it yields to playback I/O.
     log.info("Running ffmpeg … (this may take several minutes)")
     try:
         result = subprocess.run(
-            cmd,
+            low_priority_prefix() + cmd,
             capture_output=True,
             text=True,
         )
@@ -789,10 +996,30 @@ def process_file(file_path: Path) -> bool:
         return False
 
     if result.returncode != 0:
-        log.error(
-            "ffmpeg exited with code %d.\nstderr:\n%s",
-            result.returncode, result.stderr.strip()
-        )
+        stderr = result.stderr.strip()
+        # Detect unset-timestamp errors specifically — these come from a
+        # malformed source MKV where video packets have no PTS/DTS stored in
+        # the container.  ffmpeg 7.x's matroska muxer rejects such packets
+        # even in copy mode (genpts can't help without decoding).
+        # Repair the source file first with:
+        #   mkvmerge -o fixed.mkv original.mkv
+        # then reprocess the fixed file.
+        if "Can't write packet with unknown timestamp" in stderr:
+            log.error(
+                "ffmpeg exited with code %d — video stream has unset timestamps "
+                "(malformed container; ffmpeg 7.x cannot stream-copy these packets).\n"
+                "Repair the source file first:\n"
+                "  mkvmerge -o \"%s\" \"%s\"\n"
+                "then reprocess the repaired file.",
+                result.returncode,
+                file_path.with_stem(file_path.stem + ".fixed"),
+                file_path,
+            )
+        else:
+            log.error(
+                "ffmpeg exited with code %d.\nstderr:\n%s",
+                result.returncode, stderr,
+            )
         cleanup_temp(tmp_path)
         return False
 
@@ -809,6 +1036,20 @@ def process_file(file_path: Path) -> bool:
         return False
 
     # ── Step 8: Atomic replace ─────────────────────────────────────────────────
+    # If the output was staged on the NVMe, move it back into the source
+    # directory first (one sequential cross-device copy).  The original is
+    # still only ever replaced by the same-filesystem os.replace() below.
+    if tmp_path != local_tmp:
+        log.info("Moving staged output back to media directory …")
+        try:
+            shutil.move(str(tmp_path), str(local_tmp))
+        except OSError as exc:
+            log.error("Failed to move staged output back: %s", exc)
+            cleanup_temp(tmp_path)
+            cleanup_temp(local_tmp)  # remove any partial cross-device copy
+            return False
+        tmp_path = local_tmp
+
     # os.replace() is POSIX-atomic when src and dst are on the same filesystem.
     # The original file is replaced in a single syscall — no window where
     # both or neither file exists.

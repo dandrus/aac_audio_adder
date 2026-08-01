@@ -32,7 +32,6 @@ import os
 import shutil
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -75,20 +74,6 @@ AAC_AS_FIRST_TRACK: bool = True
 # are excluded; plain dialogue subs are preferred over SDH and forced tracks.
 # If no English subtitle exists, subtitle dispositions are left untouched.
 SET_ENGLISH_SUBTITLE_DEFAULT: bool = True
-
-# If True, restore the media file's modification time after processing so a
-# remux never bumps old media into Jellyfin's "Recently Added".  The restored
-# time is the OLDER of the file's pre-processing mtime and the date stored in
-# the per-folder sidecar below — except on fresh *arr imports
-# (radarr_isupgrade/sonarr_isupgrade == "False"), which keep their own fresh
-# timestamp so new content still appears in Recently Added.
-PRESERVE_MTIMES: bool = True
-
-# Per-folder sidecar holding the canonical original date, shared with the
-# date_keeper project (preserve_date.py / backfill_dates.py).  Same filename
-# and naive-local ISO format ("%Y-%m-%dT%H:%M:%S") so the two systems
-# interoperate.  Seeded here from the pre-processing mtime when missing.
-ORIGINAL_DATE_FILE: str = "original_date.txt"
 
 # Staging directory for ffmpeg temp output, on the NVMe (/mnt/mediadepot).
 # Writing the temp file on the same spinning disk as the source creates
@@ -877,88 +862,6 @@ def cleanup_temp(tmp_path: Path) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ORIGINAL DATE PRESERVATION
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def read_original_date(folder: Path) -> Optional[float]:
-    """
-    Return the timestamp stored in the folder's ORIGINAL_DATE_FILE, or None
-    if the sidecar is missing or unreadable.  Format matches date_keeper's
-    preserve_date.py: a single naive-local ISO datetime line.
-    """
-    date_file = folder / ORIGINAL_DATE_FILE
-    if not date_file.exists():
-        return None
-    try:
-        raw = date_file.read_text(encoding="utf-8").strip()
-        return datetime.fromisoformat(raw).timestamp()
-    except (ValueError, OSError) as exc:
-        log.warning("Could not read %s: %s", date_file, exc)
-        return None
-
-
-def seed_original_date(folder: Path, mtime: float) -> None:
-    """
-    Create the folder's ORIGINAL_DATE_FILE from *mtime* if it doesn't exist.
-    Never overwrites an existing sidecar — that file is canonical.
-    """
-    date_file = folder / ORIGINAL_DATE_FILE
-    if date_file.exists():
-        return
-    iso = datetime.fromtimestamp(mtime).strftime("%Y-%m-%dT%H:%M:%S")
-    try:
-        date_file.write_text(iso + "\n", encoding="utf-8")
-        log.info("Seeded %s with date %s", date_file, iso)
-    except OSError as exc:
-        log.warning("Could not seed %s: %s", date_file, exc)
-
-
-def _is_fresh_import() -> bool:
-    """
-    True when the current *arr invocation is a brand-new download rather than
-    a quality upgrade.  Fresh imports keep their own fresh mtime so they still
-    appear in Jellyfin's Recently Added (matching preserve_date.py behavior).
-    Batch/manual runs (no *arr env) return False.
-    """
-    for var in ("radarr_isupgrade", "sonarr_isupgrade"):
-        val = os.environ.get(var)
-        if val is not None:
-            return val.strip().lower() == "false"
-    return False
-
-
-def restore_original_mtime(file_path: Path, pre_mtime: float) -> None:
-    """
-    Restore *file_path*'s modification time after processing.
-
-    Target time:
-      • Fresh *arr import → the file's own pre-processing mtime (still fresh).
-      • Otherwise → the OLDER of pre_mtime and the folder sidecar date, so a
-        remux or upgrade never makes old media look newly added.
-
-    Also seeds the sidecar from pre_mtime when missing.  Failures only warn —
-    a wrong mtime is never worth failing an otherwise successful remux.
-    """
-    seed_original_date(file_path.parent, pre_mtime)
-
-    target = pre_mtime
-    if not _is_fresh_import():
-        sidecar = read_original_date(file_path.parent)
-        if sidecar is not None:
-            target = min(pre_mtime, sidecar)
-
-    try:
-        os.utime(file_path, (target, target))
-        log.info(
-            "Restored mtime on %s -> %s",
-            file_path.name,
-            datetime.fromtimestamp(target).isoformat(),
-        )
-    except OSError as exc:
-        log.warning("Could not restore mtime on %s: %s", file_path, exc)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # TEMP FILE STAGING & PROCESS PRIORITY
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1059,8 +962,6 @@ def process_file(file_path: Path) -> bool:
       7. Validate the temp output.
       8. Move a staged temp back to the source directory, then atomically
          replace the original.
-      9. Restore the original modification time (PRESERVE_MTIMES) so the
-         remux never bumps old media into Jellyfin's Recently Added.
 
     SAFETY GUARANTEE: The original file is NEVER modified unless steps 1–7
     all succeed.  On any failure, the temp file is deleted and the function
@@ -1127,10 +1028,6 @@ def process_file(file_path: Path) -> bool:
                     "File already has an English AAC track flagged default — "
                     "skipping (SKIP_IF_AAC_EXISTS=True)."
                 )
-                # Still seed the original-date sidecar so a future upgrade or
-                # reprocess of this folder can restore the right date.
-                if PRESERVE_MTIMES:
-                    seed_original_date(file_path.parent, file_path.stat().st_mtime)
                 return True
             fix_dispositions_only = True
             log.info(
@@ -1170,10 +1067,6 @@ def process_file(file_path: Path) -> bool:
         fix_dispositions_only=fix_dispositions_only,
     )
     log.debug("ffmpeg command:\n  %s", "\n  ".join(cmd))
-
-    # Capture the source mtime now — after the replace below the original
-    # timestamp is gone, and Jellyfin's Recently Added keys off it.
-    pre_mtime = file_path.stat().st_mtime
 
     # ── Step 6: Run ffmpeg ─────────────────────────────────────────────────────
     # Wrapped with ionice -c 3 / nice -n 19 so it yields to playback I/O.
@@ -1262,12 +1155,6 @@ def process_file(file_path: Path) -> bool:
         log.error("Failed to replace original file: %s", exc)
         cleanup_temp(tmp_path)
         return False
-
-    # ── Step 9: Restore original modification time ─────────────────────────────
-    # Keeps remuxed media out of Jellyfin's Recently Added; interoperates with
-    # the date_keeper project via the original_date.txt sidecar.
-    if PRESERVE_MTIMES:
-        restore_original_mtime(file_path, pre_mtime)
 
     log.info("SUCCESS: %s", file_path)
     return True

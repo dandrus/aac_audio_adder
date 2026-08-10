@@ -305,7 +305,7 @@ def codec_quality_rank(stream: Dict[str, Any]) -> int:
     """
     Return a quality rank for *stream* (lower = better = preferred source).
 
-    DTS-HD MA / DTS:X streams are promoted to rank 0 (same as TrueHD)
+    DTS-HD MA / DTS:X streams are promoted to the same rank as TrueHD
     because they are effectively lossless.  Standard DTS falls in its
     natural _CODEC_PREFERENCE position.
     """
@@ -313,7 +313,7 @@ def codec_quality_rank(stream: Dict[str, Any]) -> int:
     profile = stream.get("profile", "")
 
     if codec == "dts" and profile in _DTS_LOSSLESS_PROFILES:
-        return 0  # Promote lossless DTS to top rank
+        return _CODEC_PREFERENCE.index("truehd") + 1  # tie with TrueHD, not beat it
 
     try:
         return _CODEC_PREFERENCE.index(codec) + 1

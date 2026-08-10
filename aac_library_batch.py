@@ -46,6 +46,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -59,7 +60,8 @@ try:
     from aac_dual_audio import (
         probe_file,
         get_streams_by_type,
-        has_english_aac_track,
+        find_english_aac_track,
+        audio_dispositions_correct,
         process_file,
         SKIP_IF_AAC_EXISTS,
     )
@@ -129,9 +131,15 @@ def find_media_files(
 
     Sorted by file path so processing order is deterministic and easy to
     follow in logs.
+
+    A directory os.walk cannot read (permission denied, stale mount, etc.)
+    is logged and skipped rather than silently dropped from the results.
     """
+    def _on_walk_error(err: OSError) -> None:
+        log.warning("Cannot read directory %s (%s) — skipping.", err.filename, err)
+
     found: List[Path] = []
-    for dirpath, _dirs, filenames in os.walk(root):
+    for dirpath, _dirs, filenames in os.walk(root, onerror=_on_walk_error):
         for fname in filenames:
             fpath = Path(dirpath) / fname
             if fpath.suffix.lower() in extensions:
@@ -181,11 +189,17 @@ def needs_processing(file_path: Path) -> bool:
     """
     Quick check: return True if the file should be processed.
 
-    A file does NOT need processing if:
-      • SKIP_IF_AAC_EXISTS is True and it already has an AAC audio track.
+    A file does NOT need processing if SKIP_IF_AAC_EXISTS is True, it already
+    has an English AAC track, AND that track is the sole default audio
+    stream. This mirrors process_file()'s own Step 3 check exactly — a file
+    can have an AAC track but still need a (cheap, non-transcoding)
+    disposition-only remux if the source shipped it with the wrong default
+    flag (e.g. a foreign dub flagged default instead). Checking only
+    "has AAC" here would silently skip those files forever, since
+    process_file() would never even get called.
 
     Probing is cheap relative to transcoding; this avoids launching ffmpeg
-    for files that are already in the desired state.
+    for files that are already fully in the desired state.
 
     Returns True (needs processing) if probing fails — process_file() will
     handle the error properly and leave the file untouched.
@@ -195,7 +209,10 @@ def needs_processing(file_path: Path) -> bool:
     try:
         probe_data    = probe_file(file_path)
         audio_streams = get_streams_by_type(probe_data, "audio")
-        return not has_english_aac_track(audio_streams)
+        existing_aac  = find_english_aac_track(audio_streams)
+        if existing_aac is None:
+            return True
+        return not audio_dispositions_correct(audio_streams, existing_aac)
     except Exception as exc:
         log.warning("Could not probe %s (%s) — will attempt processing anyway.", file_path, exc)
         return True
@@ -206,9 +223,10 @@ def needs_processing(file_path: Path) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class BatchResult:
-    """Accumulates per-file results for the final summary."""
+    """Accumulates per-file results for the final summary. Thread-safe."""
 
     def __init__(self) -> None:
+        self._lock      = threading.Lock()
         self.total      = 0
         self.skipped    = 0   # Already had AAC / in resume log
         self.processed  = 0   # Successfully transcoded
@@ -216,17 +234,20 @@ class BatchResult:
         self.errors: List[Tuple[Path, str]] = []
 
     def record_skip(self) -> None:
-        self.total += 1
-        self.skipped += 1
+        with self._lock:
+            self.total += 1
+            self.skipped += 1
 
     def record_success(self) -> None:
-        self.total += 1
-        self.processed += 1
+        with self._lock:
+            self.total += 1
+            self.processed += 1
 
     def record_failure(self, path: Path, reason: str) -> None:
-        self.total += 1
-        self.failed += 1
-        self.errors.append((path, reason))
+        with self._lock:
+            self.total += 1
+            self.failed += 1
+            self.errors.append((path, reason))
 
     def print_summary(self) -> None:
         log.info("═" * 60)
@@ -286,7 +307,7 @@ def process_one(
     # Quick pre-check — avoids probing the file a second time inside process_file()
     # when SKIP_IF_AAC_EXISTS is True.
     if not needs_processing(file_path):
-        log.info("SKIP (has AAC): %s", file_path)
+        log.info("SKIP (already has correctly-flagged AAC): %s", file_path)
         result.record_skip()
         return
 
@@ -298,7 +319,14 @@ def process_one(
     success = process_file(file_path)
     if success:
         result.record_success()
-        append_to_resume_log(resume_log_path, file_path)
+        # The file itself is already processed correctly at this point — a
+        # failure to update the (purely advisory) resume log must not be
+        # reported as a processing failure, or this file gets double-counted
+        # (once here as success, once by main()'s outer exception handler).
+        try:
+            append_to_resume_log(resume_log_path, file_path)
+        except OSError as exc:
+            log.warning("Processed %s but failed to update resume log: %s", file_path, exc)
     else:
         result.record_failure(file_path, "ffmpeg or validation failure — see log above")
 

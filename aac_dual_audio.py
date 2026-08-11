@@ -687,8 +687,22 @@ def build_ffmpeg_command(
     # Apply hevc_mp4toannexb only to HEVC streams by their output video index.
     # Using -bsf:v would apply to ALL video streams, including MJPEG attached
     # pictures, which causes "Codec 'mjpeg' is not supported by hevc_mp4toannexb".
+    #
+    # Only apply the BSF when there's an actual HVCC box for it to convert.
+    # Some sources (confirmed via ffprobe: extradata_size in the low tens of
+    # bytes, vs. ~2-3 KB for a real VPS/SPS/PPS-bearing HVCC box) ship with an
+    # essentially empty/stub extradata field — the stream is already
+    # self-contained with in-band parameter sets. Forcing the BSF on those
+    # gives it nothing to convert and it fails outright ("No parameter sets
+    # in the extradata" -> "Could not write header"), even though a plain
+    # stream copy with no BSF succeeds fine. A stub HVCC box cannot hold a
+    # real VPS+SPS+PPS set, so this is a safe, non-arbitrary cutoff.
+    _MIN_HEVC_EXTRADATA_FOR_BSF = 100
     for _out_v_idx, _vs in enumerate(all_video):
-        if _vs.get("codec_name", "").lower() == "hevc":
+        if (
+            _vs.get("codec_name", "").lower() == "hevc"
+            and _vs.get("extradata_size", 0) >= _MIN_HEVC_EXTRADATA_FOR_BSF
+        ):
             cmd += [f"-bsf:v:{_out_v_idx}", "hevc_mp4toannexb"]
 
     # ── Codec: AUDIO ───────────────────────────────────────────────────────────

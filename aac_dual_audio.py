@@ -539,6 +539,7 @@ def build_ffmpeg_command(
     probe_data: Dict[str, Any],
     primary_audio: Dict[str, Any],
     fix_dispositions_only: bool = False,
+    av1_extra_input: Optional[Tuple[Path, int]] = None,
 ) -> List[str]:
     """
     Build and return the ffmpeg command list that produces the dual-audio file.
@@ -576,6 +577,18 @@ def build_ffmpeg_command(
 
     DATA STREAMS: Deliberately excluded.  Timecode tracks and other data
     streams are rarely meaningful and can cause muxing errors.
+
+    AV1 REPAIR (av1_extra_input): some AV1 WEB-DL releases (observed from the
+    "Saon" release group) carry a malformed CodecPrivate for the video track —
+    the full nested ISOBMFF 'av01' sample-entry box (av01/av1C/colr/btrt)
+    copied verbatim instead of just the inner av1C configuration record. The
+    MKV muxer requires a bare av1C record and fails "Could not write header"
+    on the boxed form, even though a plain stream copy tolerates it fine.
+    When the caller has already extracted a repaired copy of that one video
+    stream to a timestamped .ivf file (see extract_av1_ivf), av1_extra_input
+    = (ivf_path, original_absolute_stream_index) adds the ivf as INPUT 0 and
+    shifts every other mapping to read from the original file as INPUT 1 —
+    the ivf's own re-derived extradata is valid, everything else is untouched.
     """
     all_audio   = get_streams_by_type(probe_data, "audio")
     # Exclude video streams with no valid dimensions (e.g. MJPEG attached
@@ -611,11 +624,23 @@ def build_ffmpeg_command(
     # All audio streams except the chosen primary
     other_audio = [s for s in all_audio if s["index"] != primary_abs_idx]
 
+    # When av1_extra_input is set, the repaired video track is INPUT 0 (its
+    # own extradata, mapped as "0:0") and the original file moves to INPUT 1
+    # — every other stream (audio, subs, attachments, metadata, chapters)
+    # comes from there instead of INPUT 0.  `src` is that input's index as
+    # a string, used everywhere a stream is pulled from the original file.
+    src = "1" if av1_extra_input is not None else "0"
+    av1_fixed_stream_idx = av1_extra_input[1] if av1_extra_input is not None else None
+
     # ── Base command ───────────────────────────────────────────────────────────
     cmd: List[str] = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "warning",   # suppress verbose progress; use "info" to debug
+    ]
+    if av1_extra_input is not None:
+        cmd += ["-i", str(av1_extra_input[0])]
+    cmd += [
         # Increase probe limits so ffmpeg can resolve PGS subtitle parameters
         # ("unspecified size" errors) without falling back to "codec 0".
         "-probesize", "100M",
@@ -631,35 +656,40 @@ def build_ffmpeg_command(
     # ── Stream mapping — VIDEO ─────────────────────────────────────────────────
     # Map every video stream explicitly using its absolute index.
     # This preserves multi-angle discs and dual-video files correctly.
+    # The repaired AV1 stream (if any) comes from INPUT 0's only stream;
+    # everything else still comes from its absolute index in the source file.
     for vs in all_video:
-        cmd += ["-map", f"0:{vs['index']}"]
+        if av1_fixed_stream_idx is not None and vs["index"] == av1_fixed_stream_idx:
+            cmd += ["-map", "0:0"]
+        else:
+            cmd += ["-map", f"{src}:{vs['index']}"]
 
     # ── Stream mapping — AUDIO ─────────────────────────────────────────────────
     # Fix-only mode: the existing AAC track (primary_audio) is mapped ONCE,
     # first, and every other audio track follows in original order.
     if fix_dispositions_only:
-        cmd += ["-map", f"0:{primary_abs_idx}"]       # output audio 0 → existing AAC
+        cmd += ["-map", f"{src}:{primary_abs_idx}"]       # output audio 0 → existing AAC
         for oa in other_audio:
-            cmd += ["-map", f"0:{oa['index']}"]       # output audio 1+ → copy
+            cmd += ["-map", f"{src}:{oa['index']}"]       # output audio 1+ → copy
     # Normal mode: we map primary_audio TWICE:
     #   pass 1 → will receive -c:a:<N> aac  (new AAC track)
     #   pass 2 → will receive -c:a:<N> copy (original surround preserved)
     elif AAC_AS_FIRST_TRACK:
-        cmd += ["-map", f"0:{primary_abs_idx}"]   # output audio 0 → new AAC
-        cmd += ["-map", f"0:{primary_abs_idx}"]   # output audio 1 → surround copy
+        cmd += ["-map", f"{src}:{primary_abs_idx}"]   # output audio 0 → new AAC
+        cmd += ["-map", f"{src}:{primary_abs_idx}"]   # output audio 1 → surround copy
         if PRESERVE_ALL_AUDIO:
             for oa in other_audio:
-                cmd += ["-map", f"0:{oa['index']}"]   # output audio 2+ → copy
+                cmd += ["-map", f"{src}:{oa['index']}"]   # output audio 2+ → copy
     else:
-        cmd += ["-map", f"0:{primary_abs_idx}"]   # output audio 0 → surround copy
-        cmd += ["-map", f"0:{primary_abs_idx}"]   # output audio 1 → new AAC
+        cmd += ["-map", f"{src}:{primary_abs_idx}"]   # output audio 0 → surround copy
+        cmd += ["-map", f"{src}:{primary_abs_idx}"]   # output audio 1 → new AAC
         if PRESERVE_ALL_AUDIO:
             for oa in other_audio:
-                cmd += ["-map", f"0:{oa['index']}"]   # output audio 2+ → copy
+                cmd += ["-map", f"{src}:{oa['index']}"]   # output audio 2+ → copy
 
     # ── Stream mapping — SUBTITLES ─────────────────────────────────────────────
     for ss in all_subs:
-        cmd += ["-map", f"0:{ss['index']}"]
+        cmd += ["-map", f"{src}:{ss['index']}"]
 
     # ── Stream mapping — ATTACHMENTS ───────────────────────────────────────────
     # MKV attachments carry embedded cover art and fonts for ASS/SSA subtitles;
@@ -668,7 +698,7 @@ def build_ffmpeg_command(
     # The trailing '?' makes the mapping optional (no error when none exist).
     _MP4_CONTAINERS = frozenset({".mp4", ".m4v"})
     if output_path.suffix.lower() not in _MP4_CONTAINERS:
-        cmd += ["-map", "0:t?"]
+        cmd += ["-map", f"{src}:t?"]
         cmd += ["-c:t", "copy"]
 
     # ── Codec: VIDEO ───────────────────────────────────────────────────────────
@@ -794,10 +824,11 @@ def build_ffmpeg_command(
             cmd += [f"-metadata:s:a:{aac_out_idx}", f"language={lang}"]
 
     # ── Container-level metadata and chapters ──────────────────────────────────
-    # -map_metadata 0  → copy all container tags (title, year, comment, etc.)
-    # -map_chapters 0  → copy chapter markers from input
-    cmd += ["-map_metadata", "0"]
-    cmd += ["-map_chapters",  "0"]
+    # -map_metadata → copy all container tags (title, year, comment, etc.)
+    # -map_chapters → copy chapter markers.  Always sourced from the original
+    # file (src) — the repaired-AV1 ivf, when present, carries neither.
+    cmd += ["-map_metadata", src]
+    cmd += ["-map_chapters",  src]
 
     # ── Output ─────────────────────────────────────────────────────────────────
     # -y: overwrite the temp file if it somehow already exists.
@@ -809,6 +840,41 @@ def build_ffmpeg_command(
     cmd += ["-y", str(output_path)]
 
     return cmd
+
+
+def extract_av1_ivf(input_path: Path, stream_index: int, ivf_path: Path) -> bool:
+    """
+    Stream-copy a single AV1 video track out to a standalone .ivf file, as a
+    repair step for the malformed-CodecPrivate bug described in
+    build_ffmpeg_command's AV1 REPAIR note.
+
+    IVF stores an explicit per-frame timestamp (unlike a bare OBU elementary
+    stream, which has none), so round-tripping through it preserves the
+    original presentation timing exactly — verified byte-for-byte identical
+    on the first several packet PTS values during investigation — while
+    forcing ffmpeg to derive fresh extradata from the actual OBU
+    sequence-header packets in the bitstream instead of trusting the
+    source container's CodecPrivate.
+
+    Returns True on success. On failure, logs ffmpeg's stderr and returns
+    False; the caller falls back to reporting the original failure.
+    """
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+        "-i", str(input_path),
+        "-map", f"0:{stream_index}",
+        "-c:v", "copy",
+        "-f", "ivf",
+        str(ivf_path),
+    ]
+    result = subprocess.run(low_priority_prefix() + cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        log.error(
+            "AV1 IVF extraction failed (exit %d): %s",
+            result.returncode, result.stderr.strip(),
+        )
+        return False
+    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1103,6 +1169,50 @@ def process_file(file_path: Path) -> bool:
         log.error("Unexpected error running ffmpeg: %s", exc)
         cleanup_temp(tmp_path)
         return False
+
+    # ── Step 6b: AV1 CodecPrivate repair retry ─────────────────────────────────
+    # Some AV1 WEB-DL releases (observed from the "Saon" release group, e.g.
+    # Wednesday S01E05-E08) carry the full nested ISOBMFF 'av01' sample-entry
+    # box as the video track's CodecPrivate instead of a bare av1C record.
+    # ffmpeg's matroska muxer rejects that shape at header-write time — fails
+    # instantly, before any frame is processed — even though a plain stream
+    # copy into MP4 tolerates it fine. See build_ffmpeg_command's AV1 REPAIR
+    # note. Detected here purely by failure signature (not by pre-inspecting
+    # extradata) to keep the fast path unchanged for every file that doesn't
+    # hit this bug.
+    if result.returncode == 183:
+        stderr = result.stderr.strip()
+        av1_streams = [
+            s for s in video_streams if s.get("codec_name", "").lower() == "av1"
+        ]
+        if av1_streams and "Could not write header (incorrect codec parameters" in stderr:
+            log.warning(
+                "ffmpeg failed writing the container header with an AV1 video "
+                "stream present (exit 183) — likely a malformed/boxed AV1 "
+                "CodecPrivate from the source remux. Attempting automatic "
+                "repair: re-deriving extradata by round-tripping the video "
+                "track through a timestamped IVF file, then remuxing "
+                "everything else from the original."
+            )
+            av1_idx = av1_streams[0]["index"]
+            ivf_tmp = tmp_path.parent / (file_path.stem + ".__av1fix_tmp__.ivf")
+            if extract_av1_ivf(file_path, av1_idx, ivf_tmp):
+                cmd = build_ffmpeg_command(
+                    file_path, tmp_path, probe_data, primary_audio,
+                    fix_dispositions_only=fix_dispositions_only,
+                    av1_extra_input=(ivf_tmp, av1_idx),
+                )
+                log.info("Retrying with repaired AV1 video track …")
+                result = subprocess.run(
+                    low_priority_prefix() + cmd, capture_output=True, text=True,
+                )
+                if result.returncode == 0:
+                    log.info("AV1 repair succeeded.")
+                else:
+                    log.error(
+                        "AV1 repair retry still failed (exit %d).", result.returncode,
+                    )
+            cleanup_temp(ivf_tmp)
 
     if result.returncode != 0:
         stderr = result.stderr.strip()

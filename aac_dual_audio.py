@@ -84,6 +84,16 @@ SET_ENGLISH_SUBTITLE_DEFAULT: bool = True
 # the previous behavior (temp file next to the source) with a warning.
 STAGING_DIR: Path = Path("/mnt/mediadepot/aac_tmp")
 
+# Hard ceiling on how long a single ffmpeg run may take, in seconds.
+# Sonarr/Radarr run this script synchronously and wait for it to exit before
+# processing the next import, so a hung ffmpeg (corrupt source, a stalled
+# read off a network mount, etc.) would otherwise block the entire import
+# queue forever, with no way to recover short of restarting the *arr service.
+# 30 minutes is generous for an audio-only transcode (video is stream-copied)
+# even on a large multi-track file; anything past that is almost certainly
+# hung rather than genuinely still working.
+FFMPEG_TIMEOUT_SECONDS: int = 1800
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -867,7 +877,19 @@ def extract_av1_ivf(input_path: Path, stream_index: int, ivf_path: Path) -> bool
         "-f", "ivf",
         str(ivf_path),
     ]
-    result = subprocess.run(low_priority_prefix() + cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            low_priority_prefix() + cmd,
+            capture_output=True,
+            text=True,
+            timeout=FFMPEG_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        log.error(
+            "AV1 IVF extraction exceeded the %d-second timeout and was killed.",
+            FFMPEG_TIMEOUT_SECONDS,
+        )
+        return False
     if result.returncode != 0:
         log.error(
             "AV1 IVF extraction failed (exit %d): %s",
@@ -1156,12 +1178,21 @@ def process_file(file_path: Path) -> bool:
             low_priority_prefix() + cmd,
             capture_output=True,
             text=True,
+            timeout=FFMPEG_TIMEOUT_SECONDS,
         )
     except FileNotFoundError:
         log.error(
             "ffmpeg not found.  Install it:\n"
             "  sudo dnf install ffmpeg   # Fedora/RHEL\n"
             "  sudo apt install ffmpeg   # Debian/Ubuntu"
+        )
+        cleanup_temp(tmp_path)
+        return False
+    except subprocess.TimeoutExpired:
+        log.error(
+            "ffmpeg exceeded the %d-second timeout and was killed — treating "
+            "as hung rather than blocking the import queue indefinitely.",
+            FFMPEG_TIMEOUT_SECONDS,
         )
         cleanup_temp(tmp_path)
         return False
@@ -1203,15 +1234,26 @@ def process_file(file_path: Path) -> bool:
                     av1_extra_input=(ivf_tmp, av1_idx),
                 )
                 log.info("Retrying with repaired AV1 video track …")
-                result = subprocess.run(
-                    low_priority_prefix() + cmd, capture_output=True, text=True,
-                )
-                if result.returncode == 0:
-                    log.info("AV1 repair succeeded.")
-                else:
-                    log.error(
-                        "AV1 repair retry still failed (exit %d).", result.returncode,
+                try:
+                    result = subprocess.run(
+                        low_priority_prefix() + cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=FFMPEG_TIMEOUT_SECONDS,
                     )
+                except subprocess.TimeoutExpired:
+                    log.error(
+                        "AV1 repair retry exceeded the %d-second timeout and "
+                        "was killed.",
+                        FFMPEG_TIMEOUT_SECONDS,
+                    )
+                else:
+                    if result.returncode == 0:
+                        log.info("AV1 repair succeeded.")
+                    else:
+                        log.error(
+                            "AV1 repair retry still failed (exit %d).", result.returncode,
+                        )
             cleanup_temp(ivf_tmp)
 
     if result.returncode != 0:

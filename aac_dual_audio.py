@@ -628,6 +628,15 @@ _VIDEO_CODEC_NAMES: Dict[str, str] = {
     "theora":     "Theora",
 }
 
+# Still-image codecs that appear as "video" streams but are really embedded
+# cover art / poster thumbnails.  Not every muxer sets disposition.attached_pic
+# (observed: a 400x225 PNG poster with attached_pic=0 AND still_image=0), so
+# the codec name is the only reliable signal.  Titling these produces
+# nonsense like "WEBDL PNG" on a stream no viewer ever selects.
+_IMAGE_CODECS: frozenset = frozenset({
+    "png", "apng", "mjpeg", "jpeg2000", "bmp", "gif", "webp", "tiff", "ppm",
+})
+
 # ISO 639-1 and both ISO 639-2 variants (bibliographic + terminological), since
 # muxers in the wild use all three.  "und"/"mis"/"zxx" map to "" so an
 # undefined language contributes nothing to the title instead of the word
@@ -716,6 +725,17 @@ _RESOLUTION_BY_HEIGHT: Tuple[Tuple[int, str], ...] = (
 # Markers of a title that exists to advertise a site or release group rather
 # than describe the track: a bare domain, a URL, a "@ 128 kbps" style spec
 # dump, or runs of decorative punctuation.
+# Ways a subtitle track announces it carries sound descriptions for the deaf
+# and hard of hearing.  "[CC]" (closed captions) is treated as equivalent to
+# SDH — the practical distinction does not survive into a player's track list,
+# and dropping the marker entirely would make it indistinguishable from the
+# plain dialogue track.  "cc" is matched only in bracketed or word form so it
+# cannot fire on substrings inside ordinary words.
+_SDH_TITLE_RE = re.compile(
+    r"\bsdh\b|hearing[\s-]*impaired|closed[\s-]*caption|\[\s*cc\s*\]|\(\s*cc\s*\)",
+    re.I,
+)
+
 _JUNK_TITLE_PATTERNS: Tuple[Any, ...] = (
     re.compile(r"https?://",                                    re.I),
     re.compile(r"\bwww\.",                                      re.I),
@@ -781,6 +801,21 @@ def friendly_video_codec(stream: Dict[str, Any]) -> str:
     """Display name for a video codec — "HEVC", "H.264", "AV1"."""
     codec = (stream.get("codec_name") or "").lower()
     return _VIDEO_CODEC_NAMES.get(codec) or (codec.upper() if codec else "")
+
+
+def is_cover_art_stream(stream: Dict[str, Any]) -> bool:
+    """
+    True when a "video" stream is really embedded artwork, not the feature.
+
+    Checked three ways because no single one is reliable: the disposition bits
+    muxers are *supposed* to set, and the codec name for the muxers that
+    don't.  Cover art should carry no title at all — a generated one reads as
+    junk ("WEBDL PNG") on a stream that is never selectable.
+    """
+    disposition = stream.get("disposition") or {}
+    if disposition.get("attached_pic") or disposition.get("still_image"):
+        return True
+    return (stream.get("codec_name") or "").lower() in _IMAGE_CODECS
 
 
 def format_channel_layout(channels: Optional[int]) -> str:
@@ -869,11 +904,7 @@ def build_subtitle_title(stream: Dict[str, Any]) -> str:
     qualifiers: List[str] = []
     if disposition.get("forced") or "forced" in existing:
         qualifiers.append("Forced")
-    if (
-        disposition.get("hearing_impaired")
-        or "sdh" in existing
-        or "hearing impaired" in existing
-    ):
+    if disposition.get("hearing_impaired") or _SDH_TITLE_RE.search(existing):
         qualifiers.append("SDH")
     if is_commentary(stream):
         qualifiers.append("Commentary")
@@ -907,11 +938,15 @@ def compute_title_changes(
 
     if SET_TRACK_TITLES:
         for stream in get_streams_by_type(probe_data, "video"):
-            # Cover art is not a video track a viewer ever selects.
-            if (stream.get("disposition") or {}).get("attached_pic"):
+            old = stream_title(stream)
+            if is_cover_art_stream(stream):
+                # Artwork should carry no title.  Only a non-empty one is a
+                # change (clearing it); untitled cover art is already correct,
+                # so this never drags extra files into scope.
+                if old:
+                    changes.append((f"video:{stream['index']}", old, ""))
                 continue
             new = build_video_title(stream, file_path)
-            old = stream_title(stream)
             if new and new != old:
                 changes.append((f"video:{stream['index']}", old, new))
 
@@ -1273,8 +1308,12 @@ def build_ffmpeg_command(
     # is meant to replace.
     if SET_TRACK_TITLES:
         for out_v_idx, vs in enumerate(all_video):
-            # Cover art is never a track a viewer selects; leave it untitled.
-            if (vs.get("disposition") or {}).get("attached_pic"):
+            if is_cover_art_stream(vs):
+                # Artwork carries no title.  Explicitly blank it so a junk one
+                # inherited from the source (or written by an earlier version
+                # of this script) is cleared rather than preserved.
+                if stream_title(vs):
+                    cmd += [f"-metadata:s:v:{out_v_idx}", "title="]
                 continue
             video_title = build_video_title(vs, input_path)
             if video_title:

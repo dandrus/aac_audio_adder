@@ -133,6 +133,13 @@ def find_media_files(
     Sorted by file path so processing order is deterministic and easy to
     follow in logs.
 
+    This script's own in-progress temp files are excluded. process_file()
+    writes "<name>.__aac_tmp__<ext>" next to the source for the moment before
+    os.replace(), and os.walk sees dotfiles, so without this filter a batch
+    can pick up another file's half-written output as though it were library
+    content — and, if that file were later abandoned, keep doing so on every
+    subsequent run.
+
     A directory os.walk cannot read (permission denied, stale mount, etc.)
     is logged and skipped rather than silently dropped from the results.
     """
@@ -142,6 +149,8 @@ def find_media_files(
     found: List[Path] = []
     for dirpath, _dirs, filenames in os.walk(root, onerror=_on_walk_error):
         for fname in filenames:
+            if "__aac_tmp__" in fname:
+                continue
             fpath = Path(dirpath) / fname
             if fpath.suffix.lower() in extensions:
                 found.append(fpath)

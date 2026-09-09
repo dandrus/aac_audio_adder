@@ -1671,11 +1671,21 @@ def process_file(file_path: Path) -> bool:
     # The final os.replace() must be an atomic same-filesystem rename, so a
     # staged file is first moved back into the source directory (Step 8).
     # If staging is unavailable, fall back to the temp file next to the source.
+    #
+    # The in-library temp name is DOTTED on purpose.  It lands in the movie's
+    # own folder for the few seconds between the move-back and os.replace(),
+    # and an undotted "Movie.__aac_tmp__.mkv" is long-lived enough for Radarr,
+    # Jellyfin and Bazarr to notice it, treat it as a new release, and write
+    # artwork / NFO / subtitle sidecars named after it.  The rename then
+    # orphans every one of them: a previous full-library pass left ~2,700 such
+    # files behind.  Media scanners skip dotfiles, so a leading "." keeps the
+    # window invisible to them.
     output_dir = file_path.parent
-    local_tmp  = output_dir / (file_path.stem + ".__aac_tmp__" + file_path.suffix)
+    local_tmp  = output_dir / ("." + file_path.stem + ".__aac_tmp__" + file_path.suffix)
 
     staging_dir = resolve_staging_dir(file_path)
     if staging_dir is not None:
+        # STAGING_DIR is outside every library root, so this one needs no dot.
         tmp_path = staging_dir / (file_path.stem + ".__aac_tmp__" + file_path.suffix)
         log.info("Staging ffmpeg output on NVMe: %s", tmp_path)
     else:

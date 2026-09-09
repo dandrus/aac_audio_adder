@@ -29,6 +29,7 @@ MANUAL TESTING
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -49,9 +50,32 @@ AAC_BITRATE: str = "384k"
 # You can set 6 for 5.1 AAC, but stereo guarantees direct-play in browsers.
 AAC_CHANNELS: int = 2
 
-# Human-readable title embedded in the new AAC track's metadata.
-# Shown in Jellyfin's audio track selector.
-AAC_TRACK_TITLE: str = "AAC 2.0 Stereo"
+# If True, rewrite video / audio / subtitle track titles to a consistent
+# scheme derived from each stream's own properties, replacing whatever the
+# source shipped (release-group spam such as "..:::EmpireBestTV.Com:::." or
+# "ExtraFlix.Pw | English AAC2.0 @ 128 kbps", as well as empty titles).
+#
+#   video     "<resolution> <source> <codec>"   → "720p WEBDL HEVC"
+#   audio     "<layout> <codec> <language>"     → "5.1 Dolby Digital Plus English"
+#   subtitle  "<language> (<qualifiers>)"       → "Persian (Forced)"
+#
+# Commentary / forced / SDH tracks keep that distinction as a parenthetical
+# qualifier, so retitling never flattens a commentary track into a plain
+# dialogue one.  See build_video_title / build_audio_title / build_subtitle_title.
+SET_TRACK_TITLES: bool = True
+
+# If True, clear the container-level title when it looks like release-group
+# spam (see looks_like_junk_title).  A clean container title is left alone.
+# Jellyfin prefers the NFO / filename over this field, so clearing it is safe.
+CLEAR_JUNK_CONTAINER_TITLE: bool = True
+
+# Titles this script wrote in earlier versions, before track titles were
+# generated per-stream.  Still recognized by find_english_aac_track when
+# deciding whether a file already carries an AAC track we created: those
+# tracks were written without a language tag, so the title is the only
+# marker identifying them as ours.  Do not remove entries from this set —
+# doing so would make the script reprocess every file it has already done.
+LEGACY_AAC_TRACK_TITLES: frozenset = frozenset({"AAC 2.0 Stereo"})
 
 # If True, skip files that already contain an AAC audio track.
 # Set False to force reprocessing (e.g., after changing AAC_BITRATE).
@@ -331,6 +355,26 @@ def codec_quality_rank(stream: Dict[str, Any]) -> int:
         return len(_CODEC_PREFERENCE) + 1  # Unknown codec → lowest priority
 
 
+# A stereo AAC title this script generates, for a track whose language is
+# English or absent.  Anchored and language-explicit on purpose: "2.0 AAC
+# Spanish" must NOT match, or a foreign dub would be mistaken for the English
+# AAC track and the file would be skipped without ever getting one.
+_SELF_AUTHORED_AAC_TITLE_RE = re.compile(r"^\d+\.\d+ AAC(?: English)?$")
+
+
+def is_self_authored_aac_title(title: str) -> bool:
+    """
+    True when *title* is one this script wrote for an AAC track it created.
+
+    Covers both the current generated form ("2.0 AAC English") and the fixed
+    strings used by earlier versions (LEGACY_AAC_TRACK_TITLES).
+    """
+    title = title.strip()
+    if title in LEGACY_AAC_TRACK_TITLES:
+        return True
+    return bool(_SELF_AUTHORED_AAC_TITLE_RE.match(title))
+
+
 def find_english_aac_track(
     audio_streams: List[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
@@ -339,8 +383,9 @@ def find_english_aac_track(
 
     Matches on either:
       • Language tag is English ("eng", "en", "english"), OR
-      • Track title matches AAC_TRACK_TITLE — catches tracks we injected on a
-        prior run when the source had no language tag (so we never set one).
+      • Track title is one this script authored (is_self_authored_aac_title) —
+        catches tracks injected on a prior run when the source had no language
+        tag, so we never set one.
 
     Foreign-language dub AAC tracks (e.g. Turkish, Czech, Hungarian) are
     ignored — their presence does not mean the file is ready for Jellyfin
@@ -355,7 +400,7 @@ def find_english_aac_track(
         tags = s.get("tags", {})
         lang  = (tags.get("language") or tags.get("LANGUAGE") or "").lower()
         title = tags.get("title") or tags.get("TITLE") or ""
-        if lang in _ENGLISH_TAGS or title == AAC_TRACK_TITLE:
+        if lang in _ENGLISH_TAGS or is_self_authored_aac_title(title):
             return s
     return None
 
@@ -540,6 +585,359 @@ def select_default_subtitle(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TRACK TITLE GENERATION
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Titles are generated from what the stream actually *is* rather than from
+# whatever string the release group left behind.  Every builder returns ""
+# when it has nothing meaningful to say, and callers skip empty titles rather
+# than writing a blank tag.
+
+# Channel count → the layout notation viewers recognize.  Anything not listed
+# falls back to "<n>.0", which is right for plain multi-mono/multi-stereo beds.
+_CHANNEL_LAYOUTS: Dict[int, str] = {
+    1: "1.0", 2: "2.0", 3: "2.1", 4: "4.0",
+    5: "4.1", 6: "5.1", 7: "6.1", 8: "7.1", 10: "9.1",
+}
+
+_AUDIO_CODEC_NAMES: Dict[str, str] = {
+    "aac":    "AAC",
+    "ac3":    "Dolby Digital",
+    "eac3":   "Dolby Digital Plus",
+    "truehd": "Dolby TrueHD",
+    "dts":    "DTS",
+    "flac":   "FLAC",
+    "opus":   "Opus",
+    "mp3":    "MP3",
+    "mp2":    "MP2",
+    "vorbis": "Vorbis",
+    "alac":   "ALAC",
+    "wmav2":  "WMA",
+}
+
+_VIDEO_CODEC_NAMES: Dict[str, str] = {
+    "hevc":       "HEVC",
+    "h264":       "H.264",
+    "av1":        "AV1",
+    "vp9":        "VP9",
+    "vp8":        "VP8",
+    "mpeg4":      "MPEG-4",
+    "mpeg2video": "MPEG-2",
+    "mpeg1video": "MPEG-1",
+    "vc1":        "VC-1",
+    "theora":     "Theora",
+}
+
+# ISO 639-1 and both ISO 639-2 variants (bibliographic + terminological), since
+# muxers in the wild use all three.  "und"/"mis"/"zxx" map to "" so an
+# undefined language contributes nothing to the title instead of the word
+# "Und".  Unknown codes fall back to their own title-cased form.
+_LANGUAGE_NAMES: Dict[str, str] = {
+    "eng": "English",    "en": "English",
+    "spa": "Spanish",    "es": "Spanish",
+    "fre": "French",     "fra": "French",     "fr": "French",
+    "ger": "German",     "deu": "German",     "de": "German",
+    "ita": "Italian",    "it": "Italian",
+    "por": "Portuguese", "pt": "Portuguese",
+    "rus": "Russian",    "ru": "Russian",
+    "jpn": "Japanese",   "ja": "Japanese",
+    "kor": "Korean",     "ko": "Korean",
+    "chi": "Chinese",    "zho": "Chinese",    "zh": "Chinese",
+    "ara": "Arabic",     "ar": "Arabic",
+    "hin": "Hindi",      "hi": "Hindi",
+    "per": "Persian",    "fas": "Persian",    "fa": "Persian",
+    "dut": "Dutch",      "nld": "Dutch",      "nl": "Dutch",
+    "swe": "Swedish",    "sv": "Swedish",
+    "nor": "Norwegian",  "no": "Norwegian",
+    "dan": "Danish",     "da": "Danish",
+    "fin": "Finnish",    "fi": "Finnish",
+    "pol": "Polish",     "pl": "Polish",
+    "tur": "Turkish",    "tr": "Turkish",
+    "tha": "Thai",       "th": "Thai",
+    "vie": "Vietnamese", "vi": "Vietnamese",
+    "heb": "Hebrew",     "he": "Hebrew",
+    "cze": "Czech",      "ces": "Czech",      "cs": "Czech",
+    "hun": "Hungarian",  "hu": "Hungarian",
+    "gre": "Greek",      "ell": "Greek",      "el": "Greek",
+    "rum": "Romanian",   "ron": "Romanian",   "ro": "Romanian",
+    "ukr": "Ukrainian",  "uk": "Ukrainian",
+    "ind": "Indonesian", "id": "Indonesian",
+    "may": "Malay",      "msa": "Malay",      "ms": "Malay",
+    "tgl": "Tagalog",    "fil": "Filipino",
+    "cat": "Catalan",    "ca": "Catalan",
+    "bul": "Bulgarian",  "bg": "Bulgarian",
+    "hrv": "Croatian",   "hr": "Croatian",
+    "srp": "Serbian",    "sr": "Serbian",
+    "slo": "Slovak",     "slk": "Slovak",     "sk": "Slovak",
+    "slv": "Slovenian",  "sl": "Slovenian",
+    "lit": "Lithuanian", "lt": "Lithuanian",
+    "lav": "Latvian",    "lv": "Latvian",
+    "est": "Estonian",   "et": "Estonian",
+    "ice": "Icelandic",  "isl": "Icelandic",  "is": "Icelandic",
+    "alb": "Albanian",   "sqi": "Albanian",
+    "mac": "Macedonian", "mkd": "Macedonian",
+    "wel": "Welsh",      "cym": "Welsh",
+    "tam": "Tamil",      "tel": "Telugu",     "ben": "Bengali",
+    "mar": "Marathi",    "urd": "Urdu",       "pan": "Punjabi",
+    "mal": "Malayalam",  "kan": "Kannada",    "guj": "Gujarati",
+    "afr": "Afrikaans",  "bos": "Bosnian",    "lat": "Latin",
+    "gle": "Irish",      "srd": "Sardinian",  "glg": "Galician",
+    "eus": "Basque",     "baq": "Basque",
+    "und": "",           "mis": "",           "zxx": "",
+}
+
+# Source-media token, read from the filename because it is not recoverable
+# from the stream data.  Radarr/Sonarr put it in every name they write
+# ("… WEBDL-720p.mkv", "… Bluray-1080p.mkv").  Ordered most-specific first:
+# a Blu-ray remux should read "Remux", not "Bluray".
+#
+# There is deliberately no bare "WEB" fallback — it would misfire on titles
+# that simply contain the word (e.g. "Charlotte's Web (2006).mkv").
+_SOURCE_PATTERNS: Tuple[Tuple[Any, str], ...] = (
+    (re.compile(r"\bremux\b",                 re.I), "Remux"),
+    (re.compile(r"\b(?:blu-?ray|bd-?rip|br-?rip)\b", re.I), "Bluray"),
+    (re.compile(r"\bweb-?dl\b",               re.I), "WEBDL"),
+    (re.compile(r"\bweb-?rip\b",              re.I), "WEBRip"),
+    (re.compile(r"\bhdtv\b",                  re.I), "HDTV"),
+    (re.compile(r"\bdvd(?:-?rip)?\b",         re.I), "DVD"),
+)
+
+# Width is checked before height because scope/anamorphic framing crops the
+# height well below the nominal tier — a 720p widescreen encode is commonly
+# 1280x536, which a height-first rule would mislabel as 480p.
+_RESOLUTION_BY_WIDTH: Tuple[Tuple[int, str], ...] = (
+    (3840, "2160p"), (2560, "1440p"), (1920, "1080p"), (1280, "720p"),
+)
+_RESOLUTION_BY_HEIGHT: Tuple[Tuple[int, str], ...] = (
+    (2160, "2160p"), (1440, "1440p"), (1080, "1080p"), (720, "720p"),
+    (576, "576p"), (480, "480p"), (360, "360p"),
+)
+
+# Markers of a title that exists to advertise a site or release group rather
+# than describe the track: a bare domain, a URL, a "@ 128 kbps" style spec
+# dump, or runs of decorative punctuation.
+_JUNK_TITLE_PATTERNS: Tuple[Any, ...] = (
+    re.compile(r"https?://",                                    re.I),
+    re.compile(r"\bwww\.",                                      re.I),
+    re.compile(r"\.(?:com|net|org|info|biz|in|pw|cc|to|me|tv|io|xyz|club|site|online|link|ws)\b", re.I),
+    re.compile(r":{2,}"),
+    re.compile(r"@\s*\d+\s*kbps",                               re.I),
+    re.compile(r"\bencode[sd]?\s+by\b",                         re.I),
+)
+
+
+def stream_title(stream: Dict[str, Any]) -> str:
+    """Current title tag of *stream*, or "" when it carries none."""
+    tags = stream.get("tags") or {}
+    return (tags.get("title") or tags.get("TITLE") or "").strip()
+
+
+def looks_like_junk_title(title: str) -> bool:
+    """True when *title* advertises a site/release group instead of describing content."""
+    if not title.strip():
+        return False
+    return any(p.search(title) for p in _JUNK_TITLE_PATTERNS)
+
+
+def friendly_language(stream: Dict[str, Any]) -> str:
+    """Human-readable language name for *stream*, or "" if untagged/undefined."""
+    tags = stream.get("tags") or {}
+    code = (tags.get("language") or tags.get("LANGUAGE") or "").strip().lower()
+    if not code:
+        return ""
+    if code in _LANGUAGE_NAMES:
+        return _LANGUAGE_NAMES[code]
+    return code.title()
+
+
+def friendly_audio_codec(stream: Dict[str, Any]) -> str:
+    """
+    Marketing-facing codec name for an audio stream — "Dolby Digital Plus"
+    rather than "eac3".
+
+    DTS variants are read from the ffprobe *profile* ("DTS-HD MA", "DTS:X",
+    "DTS-ES"), which is where the meaningful distinction lives; the codec_name
+    is just "dts" for all of them.  An Atmos-bearing profile appends " Atmos".
+    """
+    codec   = (stream.get("codec_name") or "").lower()
+    profile = (stream.get("profile") or "").strip()
+
+    if codec.startswith("pcm"):
+        return "PCM"
+
+    name = _AUDIO_CODEC_NAMES.get(codec) or (codec.upper() if codec else "")
+
+    # "DTS-HD MA" / "DTS:X" / "DTS-ES" are strictly better labels than "DTS".
+    if codec == "dts" and "DTS" in profile.upper():
+        name = profile
+
+    if "atmos" in profile.lower() and "atmos" not in name.lower():
+        name = f"{name} Atmos"
+
+    return name
+
+
+def friendly_video_codec(stream: Dict[str, Any]) -> str:
+    """Display name for a video codec — "HEVC", "H.264", "AV1"."""
+    codec = (stream.get("codec_name") or "").lower()
+    return _VIDEO_CODEC_NAMES.get(codec) or (codec.upper() if codec else "")
+
+
+def format_channel_layout(channels: Optional[int]) -> str:
+    """Channel count → layout notation ("5.1"), or "" when unknown."""
+    if not isinstance(channels, int) or channels <= 0:
+        return ""
+    return _CHANNEL_LAYOUTS.get(channels, f"{channels}.0")
+
+
+def resolution_label(stream: Dict[str, Any]) -> str:
+    """Resolution tier ("1080p") for a video stream, or "" if undeterminable."""
+    width  = stream.get("width") or 0
+    height = stream.get("height") or 0
+    for threshold, label in _RESOLUTION_BY_WIDTH:
+        if width >= threshold:
+            return label
+    for threshold, label in _RESOLUTION_BY_HEIGHT:
+        if height >= threshold:
+            return label
+    return ""
+
+
+def detect_source_type(file_path: Path) -> str:
+    """Source-media token ("WEBDL", "Bluray") parsed from the filename, or ""."""
+    name = file_path.name
+    for pattern, label in _SOURCE_PATTERNS:
+        if pattern.search(name):
+            return label
+    return ""
+
+
+def compose_audio_title(
+    channels: Optional[int],
+    codec_label: str,
+    language: str,
+    commentary: bool = False,
+) -> str:
+    """Assemble "<layout> <codec> <language>", omitting any unknown component."""
+    parts = [p for p in (format_channel_layout(channels), codec_label, language) if p]
+    title = " ".join(parts)
+    if commentary:
+        return f"{title} (Commentary)" if title else "Commentary"
+    return title
+
+
+def build_audio_title(stream: Dict[str, Any], codec_override: str = "") -> str:
+    """
+    Title for an existing audio stream, from its own codec/channels/language.
+
+    *codec_override* names the codec the track will have in the OUTPUT — set
+    when the track is being transcoded (MP4 containers force surround audio to
+    AC3), so the title describes the result rather than the source.
+    """
+    return compose_audio_title(
+        stream.get("channels"),
+        codec_override or friendly_audio_codec(stream),
+        friendly_language(stream),
+        commentary=is_commentary(stream),
+    )
+
+
+def build_video_title(stream: Dict[str, Any], file_path: Path) -> str:
+    """Title for a video stream: "<resolution> <source> <codec>"."""
+    parts = [
+        p for p in (
+            resolution_label(stream),
+            detect_source_type(file_path),
+            friendly_video_codec(stream),
+        ) if p
+    ]
+    return " ".join(parts)
+
+
+def build_subtitle_title(stream: Dict[str, Any]) -> str:
+    """
+    Title for a subtitle stream: language plus any qualifiers that change how
+    a viewer would choose it ("English (SDH)", "Persian (Forced)").
+
+    Qualifiers are read from the disposition bits first and the incoming title
+    second — plenty of releases encode "forced"/"SDH" in the title alone and
+    never set the corresponding flag.
+    """
+    disposition = stream.get("disposition") or {}
+    existing    = stream_title(stream).lower()
+
+    qualifiers: List[str] = []
+    if disposition.get("forced") or "forced" in existing:
+        qualifiers.append("Forced")
+    if (
+        disposition.get("hearing_impaired")
+        or "sdh" in existing
+        or "hearing impaired" in existing
+    ):
+        qualifiers.append("SDH")
+    if is_commentary(stream):
+        qualifiers.append("Commentary")
+
+    language = friendly_language(stream)
+    if not language:
+        # Nothing to say about an untagged sub beyond its qualifiers; leaving
+        # the title alone beats writing a bare "(Forced)".
+        return f"({', '.join(qualifiers)})" if qualifiers else ""
+
+    return f"{language} ({', '.join(qualifiers)})" if qualifiers else language
+
+
+def compute_title_changes(
+    probe_data: Dict[str, Any],
+    file_path: Path,
+) -> List[Tuple[str, str, str]]:
+    """
+    Titles that would change if this file's existing tracks were retitled.
+
+    Returns (stream_description, current_title, new_title) for each stream
+    whose title would differ, plus a "container" entry when a junk container
+    title would be cleared.  An empty list means the file is already correct.
+
+    Only streams that already exist are considered — a newly injected AAC
+    track is not a "change" — so this is exactly the set of edits a pure
+    stream-copy remux would make, which is what both the skip check and the
+    dry-run report need.
+    """
+    changes: List[Tuple[str, str, str]] = []
+
+    if SET_TRACK_TITLES:
+        for stream in get_streams_by_type(probe_data, "video"):
+            # Cover art is not a video track a viewer ever selects.
+            if (stream.get("disposition") or {}).get("attached_pic"):
+                continue
+            new = build_video_title(stream, file_path)
+            old = stream_title(stream)
+            if new and new != old:
+                changes.append((f"video:{stream['index']}", old, new))
+
+        for stream in get_streams_by_type(probe_data, "audio"):
+            new = build_audio_title(stream)
+            old = stream_title(stream)
+            if new and new != old:
+                changes.append((f"audio:{stream['index']}", old, new))
+
+        for stream in get_streams_by_type(probe_data, "subtitle"):
+            new = build_subtitle_title(stream)
+            old = stream_title(stream)
+            if new and new != old:
+                changes.append((f"subtitle:{stream['index']}", old, new))
+
+    if CLEAR_JUNK_CONTAINER_TITLE:
+        container_title = (
+            (probe_data.get("format") or {}).get("tags") or {}
+        ).get("title") or ""
+        if looks_like_junk_title(container_title):
+            changes.append(("container", container_title.strip(), ""))
+
+    return changes
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # FFMPEG COMMAND BUILDER
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -559,8 +957,10 @@ def build_ffmpeg_command(
     flags are wrong (e.g. a foreign dub flagged default by the source).
     Every stream is copied — no transcoding — with the AAC track mapped first,
     flagged as the only default audio, and the subtitle default logic applied.
-    Existing track metadata (title, language) is left untouched.  All audio
-    tracks are always kept regardless of PRESERVE_ALL_AUDIO.
+    Language tags are left untouched; track titles are still regenerated when
+    SET_TRACK_TITLES is on, which makes this path double as the metadata-only
+    remux used to strip release-group junk from an otherwise-correct file.
+    All audio tracks are always kept regardless of PRESERVE_ALL_AUDIO.
 
     OUTPUT STREAM ORDER (when AAC_AS_FIRST_TRACK=True, PRESERVE_ALL_AUDIO=True):
     ┌──────────────────────────────────────────────────────────────────────┐
@@ -793,6 +1193,35 @@ def build_ffmpeg_command(
         for i in range(n_other):
             cmd += [f"-c:a:{other_start_idx + i}", surround_codec]
 
+    # ── Output audio track titles ──────────────────────────────────────────────
+    # Assembled here because this is the only point where each track's output
+    # index and its actual output codec are both known.  Emitted further down,
+    # after -map_metadata.
+    audio_titles: Dict[int, str] = {}
+    if SET_TRACK_TITLES:
+        if fix_dispositions_only:
+            # Every track is stream-copied, so each keeps its own properties.
+            audio_titles[aac_out_idx] = build_audio_title(primary_audio)
+            for i, other in enumerate(other_audio):
+                audio_titles[other_start_idx + i] = build_audio_title(other)
+        else:
+            # The injected track is always AAC at AAC_CHANNELS channels and
+            # inherits the primary track's language (set just below).
+            audio_titles[aac_out_idx] = compose_audio_title(
+                AAC_CHANNELS, "AAC", friendly_language(primary_audio)
+            )
+            # Copied tracks are titled by the codec they will have on the way
+            # OUT, which differs from the source only for MP4-family outputs
+            # where the ipod muxer forces an AC3 transcode.
+            copied_codec = "Dolby Digital" if surround_codec == "ac3" else ""
+            audio_titles[surround_out_idx] = build_audio_title(
+                primary_audio, codec_override=copied_codec
+            )
+            for i in range(n_other):
+                audio_titles[other_start_idx + i] = build_audio_title(
+                    other_audio[i], codec_override=copied_codec
+                )
+
     # ── Codec: SUBTITLES ───────────────────────────────────────────────────────
     cmd += ["-c:s", "copy"]
 
@@ -822,11 +1251,9 @@ def build_ffmpeg_command(
                 flag = "+default" if i == default_sub_pos else "-default"
                 cmd += [f"-disposition:s:{i}", flag]
 
-    # ── Metadata for the new AAC track ─────────────────────────────────────────
-    # Fix-only mode reuses an existing AAC track — leave its tags untouched.
+    # ── Language tag for the new AAC track ─────────────────────────────────────
+    # Fix-only mode reuses an existing AAC track — its language tag stands.
     if not fix_dispositions_only:
-        cmd += [f"-metadata:s:a:{aac_out_idx}", f"title={AAC_TRACK_TITLE}"]
-
         # Copy language tag from the primary source if available.
         primary_tags = primary_audio.get("tags") or {}
         lang = primary_tags.get("language") or primary_tags.get("LANGUAGE")
@@ -839,6 +1266,40 @@ def build_ffmpeg_command(
     # file (src) — the repaired-AV1 ivf, when present, carries neither.
     cmd += ["-map_metadata", src]
     cmd += ["-map_chapters",  src]
+
+    # ── Track titles ───────────────────────────────────────────────────────────
+    # Emitted AFTER -map_metadata deliberately: that flag re-copies the source
+    # tags, so titles set before it would be overwritten by the very junk this
+    # is meant to replace.
+    if SET_TRACK_TITLES:
+        for out_v_idx, vs in enumerate(all_video):
+            # Cover art is never a track a viewer selects; leave it untitled.
+            if (vs.get("disposition") or {}).get("attached_pic"):
+                continue
+            video_title = build_video_title(vs, input_path)
+            if video_title:
+                cmd += [f"-metadata:s:v:{out_v_idx}", f"title={video_title}"]
+
+        for out_a_idx, audio_title in sorted(audio_titles.items()):
+            if audio_title:
+                cmd += [f"-metadata:s:a:{out_a_idx}", f"title={audio_title}"]
+
+        for out_s_idx, ss in enumerate(all_subs):
+            subtitle_title = build_subtitle_title(ss)
+            if subtitle_title:
+                cmd += [f"-metadata:s:s:{out_s_idx}", f"title={subtitle_title}"]
+
+    # ── Container title ────────────────────────────────────────────────────────
+    # Release-group spam in the container title shows up in some players and
+    # in ffprobe output.  Cleared to empty rather than replaced — Jellyfin
+    # reads the NFO/filename for the real name, so inventing one here would
+    # add nothing and risk disagreeing with the library.
+    if CLEAR_JUNK_CONTAINER_TITLE:
+        container_title = (
+            (probe_data.get("format") or {}).get("tags") or {}
+        ).get("title") or ""
+        if looks_like_junk_title(container_title):
+            cmd += ["-metadata", "title="]
 
     # ── Output ─────────────────────────────────────────────────────────────────
     # -y: overwrite the temp file if it somehow already exists.
@@ -1126,18 +1587,35 @@ def process_file(file_path: Path) -> bool:
         existing_aac = find_english_aac_track(audio_streams)
         if existing_aac is not None:
             if audio_dispositions_correct(audio_streams, existing_aac):
+                # The audio itself is already right, but the file may still
+                # carry release-group junk in its track titles.  Retitling is
+                # a pure metadata edit, so it reuses the same stream-copy path
+                # as a disposition fix.
+                title_changes = compute_title_changes(probe_data, file_path)
+                if not title_changes:
+                    log.info(
+                        "File already has an English AAC track flagged default "
+                        "and correct track titles — skipping "
+                        "(SKIP_IF_AAC_EXISTS=True)."
+                    )
+                    return True
+                fix_dispositions_only = True
                 log.info(
-                    "File already has an English AAC track flagged default — "
-                    "skipping (SKIP_IF_AAC_EXISTS=True)."
+                    "English AAC track and default flags are already correct, "
+                    "but %d track title(s) need updating — metadata-only remux "
+                    "(all streams copied, no transcoding).",
+                    len(title_changes),
                 )
-                return True
-            fix_dispositions_only = True
-            log.info(
-                "English AAC track exists (index %d) but audio default flags "
-                "are wrong — disposition-only remux (all streams copied, no "
-                "transcoding).",
-                existing_aac["index"],
-            )
+                for desc, old_title, new_title in title_changes:
+                    log.info("  %-12s %r → %r", desc, old_title, new_title)
+            else:
+                fix_dispositions_only = True
+                log.info(
+                    "English AAC track exists (index %d) but audio default flags "
+                    "are wrong — disposition-only remux (all streams copied, no "
+                    "transcoding).",
+                    existing_aac["index"],
+                )
 
     # ── Step 4: Select primary audio ───────────────────────────────────────────
     if fix_dispositions_only:

@@ -64,15 +64,33 @@ All settings are constants at the top of `aac_dual_audio.py`:
 |---|---|---|
 | `AAC_BITRATE` | `"384k"` | Bitrate for the new AAC track |
 | `AAC_CHANNELS` | `2` | Output channels (2 = stereo) |
-| `AAC_TRACK_TITLE` | `"AAC 2.0 Stereo"` | Track label shown in player UI |
+| `SET_TRACK_TITLES` | `True` | Rewrite track titles to a consistent scheme (see below) |
+| `CLEAR_JUNK_CONTAINER_TITLE` | `True` | Blank the container title when it is release-group spam |
 | `SKIP_IF_AAC_EXISTS` | `True` | Skip files that already have an AAC track |
 | `PRESERVE_ALL_AUDIO` | `True` | Keep all original audio tracks (dubs, commentary, etc.) |
 | `AAC_AS_FIRST_TRACK` | `True` | Put AAC at track index 0 and mark it default |
 
+### Track titles
+
+With `SET_TRACK_TITLES` enabled, every track is retitled from its own
+properties, replacing release-group spam like `..:::EmpireBestTV.Com:::.` or
+`ExtraFlix.Pw | English AAC2.0 @ 128 kbps`:
+
+| Type | Scheme | Example |
+|---|---|---|
+| video | `<resolution> <source> <codec>` | `720p WEBDL HEVC` |
+| audio | `<layout> <codec> <language>` | `5.1 Dolby Digital Plus English` |
+| subtitle | `<language> (<qualifiers>)` | `Persian (Forced)`, `English (SDH)` |
+
+Commentary, forced, and SDH tracks keep that distinction as a parenthetical
+qualifier, so a commentary track is never flattened into plain dialogue. A file
+that already has a correct AAC track but junk titles gets a metadata-only
+remux — a pure stream copy, no re-encoding, usually a few seconds.
+
 ## How It Works
 
 1. **Probe** — `ffprobe` reads all stream metadata as JSON.
-2. **Skip check** — if an AAC track already exists and `SKIP_IF_AAC_EXISTS=True`, exit.
+2. **Skip check** — if an AAC track already exists, is flagged default, and all track titles are already correct, exit. If only the titles or default flags are wrong, a metadata-only remux runs instead (stream copy, no transcoding).
 3. **Select primary audio** — filters out commentary tracks, prefers English, prefers the encoder-default-flagged track, then ranks by codec quality (TrueHD / DTS-HD MA > DTS > EAC3 > AC3 …).
 4. **Build ffmpeg command** — maps the primary stream *twice*: once transcoded to AAC, once stream-copied as the original surround.
 5. **Write to temp file** — output goes to `filename.__aac_tmp__.ext` in the same directory.

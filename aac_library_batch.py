@@ -62,6 +62,7 @@ try:
         get_streams_by_type,
         find_english_aac_track,
         audio_dispositions_correct,
+        compute_title_changes,
         process_file,
         SKIP_IF_AAC_EXISTS,
     )
@@ -190,13 +191,19 @@ def needs_processing(file_path: Path) -> bool:
     Quick check: return True if the file should be processed.
 
     A file does NOT need processing if SKIP_IF_AAC_EXISTS is True, it already
-    has an English AAC track, AND that track is the sole default audio
-    stream. This mirrors process_file()'s own Step 3 check exactly — a file
-    can have an AAC track but still need a (cheap, non-transcoding)
-    disposition-only remux if the source shipped it with the wrong default
-    flag (e.g. a foreign dub flagged default instead). Checking only
+    has an English AAC track, that track is the sole default audio stream,
+    AND every track title is already correct. This mirrors process_file()'s
+    own Step 3 check exactly — a file can have an AAC track but still need a
+    (cheap, non-transcoding) disposition-only remux if the source shipped it
+    with the wrong default flag (e.g. a foreign dub flagged default instead),
+    or if its titles still carry release-group junk. Checking only
     "has AAC" here would silently skip those files forever, since
     process_file() would never even get called.
+
+    KEEP THIS IN SYNC WITH process_file()'s Step 3. The two checks are
+    deliberately duplicated so the batch can skip without paying for a second
+    probe, which means any condition added there must be added here too —
+    otherwise the batch silently skips files the single-file path would fix.
 
     Probing is cheap relative to transcoding; this avoids launching ffmpeg
     for files that are already fully in the desired state.
@@ -212,7 +219,11 @@ def needs_processing(file_path: Path) -> bool:
         existing_aac  = find_english_aac_track(audio_streams)
         if existing_aac is None:
             return True
-        return not audio_dispositions_correct(audio_streams, existing_aac)
+        if not audio_dispositions_correct(audio_streams, existing_aac):
+            return True
+        # Audio is already correct, but titles may still need the same
+        # metadata-only remux process_file() would run for them.
+        return bool(compute_title_changes(probe_data, file_path))
     except Exception as exc:
         log.warning("Could not probe %s (%s) — will attempt processing anyway.", file_path, exc)
         return True

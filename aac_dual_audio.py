@@ -711,15 +711,40 @@ _SOURCE_PATTERNS: Tuple[Tuple[Any, str], ...] = (
     (re.compile(r"\bdvd(?:-?rip)?\b",         re.I), "DVD"),
 )
 
-# Width is checked before height because scope/anamorphic framing crops the
-# height well below the nominal tier — a 720p widescreen encode is commonly
-# 1280x536, which a height-first rule would mislabel as 480p.
+# Resolution is classified from width AND height independently, then the
+# HIGHER of the two tiers wins.  Neither dimension alone is sufficient:
+#
+#   1280x536  scope 720p    — height reads as 480p, width is right
+#   720x304   letterboxed   — height matches nothing at all, width is right
+#   1024x576  PAL 576p      — width reads as 480p, height is right
+#   640x480   4:3 SD        — width matches nothing at all, height is right
+#
+# Taking the max gets all four right, where either rule alone gets some wrong.
+# Ranks are compared by position in _RESOLUTION_ORDER.
+_RESOLUTION_ORDER: Tuple[str, ...] = (
+    "360p", "480p", "576p", "720p", "1080p", "1440p", "2160p",
+)
+
+# Thresholds sit BELOW each nominal dimension (roughly 94%) because real
+# encodes rarely hit it exactly — scope framing crops width as well as
+# height. A strict >=1280 test calls a 1248x520 scope 720p release "480p".
 _RESOLUTION_BY_WIDTH: Tuple[Tuple[int, str], ...] = (
-    (3840, "2160p"), (2560, "1440p"), (1920, "1080p"), (1280, "720p"),
+    (3600, "2160p"),   # 3840
+    (2400, "1440p"),   # 2560
+    (1800, "1080p"),   # 1920
+    (1200, "720p"),    # 1280
+    (960,  "576p"),    # 1024
+    (700,  "480p"),    # 720  (NTSC DVD width; also catches 720x304 letterbox)
 )
 _RESOLUTION_BY_HEIGHT: Tuple[Tuple[int, str], ...] = (
-    (2160, "2160p"), (1440, "1440p"), (1080, "1080p"), (720, "720p"),
-    (576, "576p"), (480, "480p"), (360, "360p"),
+    (2000, "2160p"),   # 2160
+    (1300, "1440p"),   # 1440
+    (1000, "1080p"),   # 1080 (also 1440x1080 anamorphic, which width alone
+                       #       would rank as 720p)
+    (680,  "720p"),    # 720
+    (540,  "576p"),    # 576
+    (440,  "480p"),    # 480
+    (320,  "360p"),    # 360
 )
 
 # Markers of a title that exists to advertise a site or release group rather
@@ -826,16 +851,27 @@ def format_channel_layout(channels: Optional[int]) -> str:
 
 
 def resolution_label(stream: Dict[str, Any]) -> str:
-    """Resolution tier ("1080p") for a video stream, or "" if undeterminable."""
-    width  = stream.get("width") or 0
-    height = stream.get("height") or 0
-    for threshold, label in _RESOLUTION_BY_WIDTH:
-        if width >= threshold:
-            return label
-    for threshold, label in _RESOLUTION_BY_HEIGHT:
-        if height >= threshold:
-            return label
-    return ""
+    """
+    Resolution tier ("1080p") for a video stream, or "" if undeterminable.
+
+    Both dimensions are classified and the higher tier wins — see the comment
+    on _RESOLUTION_ORDER for why either rule alone mislabels real content.
+    """
+    def tier(value: int, table: Tuple[Tuple[int, str], ...]) -> Optional[str]:
+        for threshold, label in table:
+            if value >= threshold:
+                return label
+        return None
+
+    candidates = [
+        c for c in (
+            tier(stream.get("width") or 0, _RESOLUTION_BY_WIDTH),
+            tier(stream.get("height") or 0, _RESOLUTION_BY_HEIGHT),
+        ) if c is not None
+    ]
+    if not candidates:
+        return ""
+    return max(candidates, key=_RESOLUTION_ORDER.index)
 
 
 def detect_source_type(file_path: Path) -> str:

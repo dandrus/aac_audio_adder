@@ -69,6 +69,34 @@ SET_TRACK_TITLES: bool = True
 # Jellyfin prefers the NFO / filename over this field, so clearing it is safe.
 CLEAR_JUNK_CONTAINER_TITLE: bool = True
 
+# If True, check imported files for the "correct size, zero-filled content"
+# corruption and report it unmistakably (see detect_zero_fill).
+#
+# Observed repeatedly on this library: an incomplete usenet download that the
+# download client nonetheless reported as finished.  Missing segments are
+# written out as real zeros — the file ends up the expected size and fully
+# allocated on disk, so nothing downstream notices.  One measured example was
+# 86.6% zeros after 22 failed grabs of the same episode.
+#
+# The script already probes every import, so it ALREADY fails on these; it
+# just failed quietly, and the damage went unnoticed for months until Jellyfin
+# choked on playback.  This makes the signal loud at import time instead.
+#
+# Detection is read-only and never deletes or quarantines anything — a false
+# positive costs a log line, and the decision of what to do stays with a human.
+DETECT_ZERO_FILL: bool = True
+
+# How many evenly-spaced chunks to sample when checking for zero-fill.
+# 32 reads of 64 KiB is a few milliseconds even on spinning disks.
+ZERO_FILL_SAMPLES: int = 32
+
+# Fraction of sampled chunks that must be entirely zero before a file whose
+# header is INTACT is called suspicious.  Compressed video effectively never
+# contains 64 KiB of zeros — even black frames and silence encode to non-zero
+# data — so this is deliberately low.  A zeroed header alone is treated as
+# definitive regardless of this value.
+ZERO_FILL_WARN_FRACTION: float = 0.05
+
 # Titles this script wrote in earlier versions, before track titles were
 # generated per-stream.  Still recognized by find_english_aac_track when
 # deciding whether a file already carries an AAC track we created: those
@@ -183,6 +211,119 @@ def detect_caller() -> Tuple[str, Path]:
 # ═══════════════════════════════════════════════════════════════════════════════
 # FFPROBE HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def detect_zero_fill(
+    file_path: Path,
+    samples: Optional[int] = None,
+    chunk: int = 65536,
+) -> Tuple[float, bool, int]:
+    """
+    Sample *file_path* for zero-filled regions.
+
+    Returns (zero_fraction, header_zeroed, chunks_sampled).
+
+    Reads *samples* evenly spaced chunks, always including offset 0. A chunk
+    counts as zero only when every byte in it is 0x00.
+
+    The two signals differ in strength and are reported separately on purpose:
+
+      header_zeroed   Definitive. No container on earth starts with 64 KiB of
+                      zeros, so the file cannot be valid — this is exactly
+                      what makes ffprobe fail on these.
+      zero_fraction   Heuristic, for files whose header survived but whose
+                      body has holes. Compressed video essentially never
+                      contains a 64 KiB run of zeros, but "essentially never"
+                      is not "never", so this only ever warns.
+
+    Read-only, and cheap: 32 x 64 KiB is a few milliseconds even on a spinning
+    disk. Any read error is reported as "not detected" rather than raising —
+    this is a diagnostic, and it must never be the reason an import fails.
+    """
+    if samples is None:
+        samples = ZERO_FILL_SAMPLES
+
+    try:
+        size = file_path.stat().st_size
+    except OSError:
+        return (0.0, False, 0)
+
+    if size == 0:
+        return (1.0, True, 0)
+
+    # Offsets are clamped so the final sample never runs past EOF.
+    max_offset = max(0, size - chunk)
+    offsets = [0] if samples <= 1 else [
+        min(max_offset, (size * i) // samples) for i in range(samples)
+    ]
+
+    zero_chunks = 0
+    sampled     = 0
+    header_zeroed = False
+
+    try:
+        with open(file_path, "rb") as handle:
+            for position, offset in enumerate(offsets):
+                handle.seek(offset)
+                data = handle.read(chunk)
+                if not data:
+                    continue
+                sampled += 1
+                if not data.strip(b"\x00"):
+                    zero_chunks += 1
+                    if position == 0:
+                        header_zeroed = True
+    except OSError as exc:
+        log.debug("Zero-fill check could not read %s (%s).", file_path, exc)
+        return (0.0, False, sampled)
+
+    fraction = (zero_chunks / sampled) if sampled else 0.0
+    return (fraction, header_zeroed, sampled)
+
+
+def report_zero_fill(file_path: Path, probe_failed: bool) -> bool:
+    """
+    Run the zero-fill check and log the outcome. Returns True if the file
+    looks corrupt.
+
+    The log line is deliberately distinctive ("CORRUPT (zero-filled)") so it
+    can be grepped or alerted on without parsing ffmpeg's output.
+    """
+    if not DETECT_ZERO_FILL:
+        return False
+
+    fraction, header_zeroed, sampled = detect_zero_fill(file_path)
+    if not sampled:
+        return False
+
+    if header_zeroed:
+        log.error(
+            "CORRUPT (zero-filled): %s — first 64 KiB is all zeros and %.0f%% "
+            "of %d sampled chunks are zero. The file is its full expected size "
+            "but the content is missing: this is an incomplete download that "
+            "the download client reported as finished. Re-grab it from a "
+            "different source; the file is not repairable.",
+            file_path, fraction * 100, sampled,
+        )
+        return True
+
+    if fraction >= ZERO_FILL_WARN_FRACTION:
+        log.warning(
+            "SUSPECT (partial zero-fill): %s — header is intact but %.0f%% of "
+            "%d sampled chunks are entirely zero. Playback may fail partway "
+            "through. Worth verifying against a known-good copy.",
+            file_path, fraction * 100, sampled,
+        )
+        return True
+
+    if probe_failed:
+        log.error(
+            "Probe failed but the file is NOT zero-filled (%.0f%% of %d chunks "
+            "zero) — a different kind of damage (truncated, wrong container, "
+            "or an unsupported codec).",
+            fraction * 100, sampled,
+        )
+    return False
+
 
 def probe_file(file_path: Path) -> Dict[str, Any]:
     """
@@ -1624,8 +1765,17 @@ def process_file(file_path: Path) -> bool:
     try:
         probe_data = probe_file(file_path)
     except Exception:
+        # A probe failure is where zero-filled imports surface. Say WHY the
+        # file is unreadable rather than just that it is — the difference
+        # between "incomplete download, re-grab it" and "unsupported codec"
+        # changes what the human should do about it.
+        report_zero_fill(file_path, probe_failed=True)
         log.error("Failed to probe input file. Aborting.")
         return False
+
+    # A file whose header survived but whose body has holes probes fine and
+    # would otherwise import silently, failing only on playback later.
+    report_zero_fill(file_path, probe_failed=False)
 
     audio_streams    = get_streams_by_type(probe_data, "audio")
     video_streams    = get_streams_by_type(probe_data, "video")

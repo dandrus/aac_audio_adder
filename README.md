@@ -8,7 +8,7 @@ With an AAC track marked as default, browsers direct-play the file. Clients that
 
 | Script | Purpose |
 |---|---|
-| `aac_dual_audio.py` | Radarr/Sonarr post-processing hook — runs automatically on import |
+| `aac_dual_audio.py` | Radarr/Sonarr post-processing hook — runs automatically on import. Also provides `--scan` for read-only zero-fill auditing |
 | `aac_library_batch.py` | One-shot batch processor for an existing library |
 
 ## Requirements
@@ -55,6 +55,41 @@ python3 aac_library_batch.py /media/jellyfin \
 ```
 
 Both scripts must be in the same directory — `aac_library_batch.py` imports shared logic from `aac_dual_audio.py`.
+
+## Usage: Zero-Fill Scan
+
+Audits an existing library for **zero-filled** files — downloads that finished
+with the correct file size but missing content, written out as real zeros. They
+are fully allocated on disk, so nothing downstream notices until playback fails.
+
+```bash
+# Full scan: 32 samples per file, catches partial zero-fill too
+python3 aac_dual_audio.py --scan /media/movies /media/shows
+
+# Quick scan: header only. Definitive for fully zero-filled files and fast
+# enough to run nightly (~70 files/s, ~13,800 files in 3½ minutes)
+python3 aac_dual_audio.py --scan /media/shows --quick
+
+# Only files imported in the last day, with a JSON report
+python3 aac_dual_audio.py --scan /media/shows --quick --newer-than 1 \
+  --report /var/log/aac_scan.json
+```
+
+Exit codes: `0` clean, `2` damage found, `1` the scan itself failed.
+
+**Why this is separate from the import hook.** When a file is corrupt enough
+that `ffprobe` cannot read its header, Sonarr throws while building the
+environment variables for a custom script and never launches it —
+
+```
+Warn|NotificationService|Unable to send OnDownload notification to: AAC audio
+System.NullReferenceException
+  at MediaInfoFormatter.FormatAudioChannelsFromAudioChannelPositions
+```
+
+— and then imports the file anyway. The files that most need catching are
+exactly the ones the import hook can never see. Scanning is read-only: nothing
+is transcoded, moved, or deleted.
 
 ## Configuration
 

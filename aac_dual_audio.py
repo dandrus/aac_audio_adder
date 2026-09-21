@@ -24,8 +24,26 @@ MANUAL TESTING
 ──────────────
   radarr_moviefile_path=/path/to/file.mkv python3 aac_dual_audio.py
   sonarr_episodefile_path=/path/to/episode.mkv python3 aac_dual_audio.py
+
+SCAN MODE
+─────────
+  aac_dual_audio.py --scan /mnt/media/shows [/mnt/media/movies ...]
+
+Walks a library and reports zero-filled (silently corrupt) files WITHOUT
+touching them.  This exists because the post-processing path above cannot
+catch the worst cases: when a file is corrupt enough that ffprobe fails,
+Sonarr throws while building this script's environment variables and never
+launches it at all —
+
+  Warn|NotificationService|Unable to send OnDownload notification to: AAC audio
+  System.NullReferenceException
+    at MediaInfoFormatter.FormatAudioChannelsFromAudioChannelPositions
+
+— then imports the file anyway.  Scan mode is the safety net for exactly the
+files import-time detection can never see.  See the SCAN MODE section below.
 """
 
+import argparse
 import json
 import logging
 import os
@@ -33,6 +51,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -96,6 +115,10 @@ ZERO_FILL_SAMPLES: int = 32
 # data — so this is deliberately low.  A zeroed header alone is treated as
 # definitive regardless of this value.
 ZERO_FILL_WARN_FRACTION: float = 0.05
+
+# File extensions scan mode considers to be media.  Kept in step with
+# aac_library_batch.py's DEFAULT_MEDIA_EXTENSIONS.
+SCAN_MEDIA_EXTENSIONS: Tuple[str, ...] = (".mkv", ".mp4", ".ts", ".m4v")
 
 # Titles this script wrote in earlier versions, before track titles were
 # generated per-stream.  Still recognized by find_english_aac_track when
@@ -280,6 +303,28 @@ def detect_zero_fill(
     return (fraction, header_zeroed, sampled)
 
 
+def classify_zero_fill(
+    fraction: float,
+    header_zeroed: bool,
+    sampled: int,
+) -> str:
+    """
+    Turn a detect_zero_fill() result into a verdict: "corrupt", "suspect" or
+    "clean".
+
+    Both callers — import-time reporting and scan mode — go through here so
+    the thresholds can only ever be defined once. They report at different
+    verbosity, but they must never disagree about what counts as damaged.
+    """
+    if not sampled:
+        return "clean"
+    if header_zeroed:
+        return "corrupt"
+    if fraction >= ZERO_FILL_WARN_FRACTION:
+        return "suspect"
+    return "clean"
+
+
 def report_zero_fill(file_path: Path, probe_failed: bool) -> bool:
     """
     Run the zero-fill check and log the outcome. Returns True if the file
@@ -295,7 +340,9 @@ def report_zero_fill(file_path: Path, probe_failed: bool) -> bool:
     if not sampled:
         return False
 
-    if header_zeroed:
+    verdict = classify_zero_fill(fraction, header_zeroed, sampled)
+
+    if verdict == "corrupt":
         log.error(
             "CORRUPT (zero-filled): %s — first 64 KiB is all zeros and %.0f%% "
             "of %d sampled chunks are zero. The file is its full expected size "
@@ -306,7 +353,7 @@ def report_zero_fill(file_path: Path, probe_failed: bool) -> bool:
         )
         return True
 
-    if fraction >= ZERO_FILL_WARN_FRACTION:
+    if verdict == "suspect":
         log.warning(
             "SUSPECT (partial zero-fill): %s — header is intact but %.0f%% of "
             "%d sampled chunks are entirely zero. Playback may fail partway "
@@ -2040,10 +2087,258 @@ def process_file(file_path: Path) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SCAN MODE
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Import-time detection has a blind spot it cannot close from the inside.
+#
+# When a file is zero-filled badly enough that ffprobe cannot read its header,
+# Sonarr fails to build the media-info environment variables it passes to a
+# custom script, throws NullReferenceException inside the notification
+# machinery, logs "Unable to send OnDownload notification to: AAC audio", and
+# imports the file anyway.  This script is never executed, so report_zero_fill()
+# never runs.  The files that most need catching are exactly the ones that
+# never reach the detector.
+#
+# Scan mode closes that gap from the outside: walk the library, sample every
+# media file, report what is damaged.  It is strictly read-only — no ffmpeg, no
+# renames, no deletions.  Deciding what to do about a bad file stays with a
+# human, same as at import time.
+
+def find_media_files(
+    roots: List[Path],
+    extensions: Tuple[str, ...],
+    newer_than_days: Optional[float] = None,
+) -> List[Path]:
+    """
+    Walk *roots* and return sorted media files matching *extensions*.
+
+    In-progress temp files ("__aac_tmp__") are excluded: a scan running
+    alongside a transcode would otherwise sample a half-written output file
+    and report it as damaged.
+
+    *newer_than_days* limits results to files modified within that window,
+    which is what makes a frequent scheduled scan cheap — a nightly run only
+    needs to look at what was imported since the last one.
+
+    Unreadable directories are logged and skipped rather than aborting the
+    walk; one stale mount should not cost a whole scan.
+    """
+    def _on_walk_error(err: OSError) -> None:
+        log.warning("Cannot read directory %s (%s) — skipping.", err.filename, err)
+
+    cutoff: Optional[float] = None
+    if newer_than_days is not None:
+        cutoff = time.time() - (newer_than_days * 86400)
+
+    found: List[Path] = []
+    for root in roots:
+        if not root.exists():
+            log.error("Scan path does not exist: %s", root)
+            continue
+        for dirpath, _dirs, filenames in os.walk(root, onerror=_on_walk_error):
+            for fname in filenames:
+                if "__aac_tmp__" in fname:
+                    continue
+                fpath = Path(dirpath) / fname
+                if fpath.suffix.lower() not in extensions:
+                    continue
+                if cutoff is not None:
+                    try:
+                        if fpath.stat().st_mtime < cutoff:
+                            continue
+                    except OSError:
+                        continue
+                found.append(fpath)
+    return sorted(found)
+
+
+def scan_for_zero_fill(
+    roots: List[Path],
+    extensions: Tuple[str, ...] = SCAN_MEDIA_EXTENSIONS,
+    newer_than_days: Optional[float] = None,
+    quick: bool = False,
+    report_path: Optional[Path] = None,
+) -> int:
+    """
+    Scan *roots* for zero-filled files.  Returns the number found.
+
+    *quick* samples only the first 64 KiB of each file.  That is the
+    definitive signal on its own — no real container begins with 64 KiB of
+    zeros — and it reads ~2 MB less per file, which is the difference between
+    a scan that can run nightly and one that cannot.  It cannot find partial
+    zero-fill in a file whose header survived; a full scan is worth running
+    periodically for that.
+
+    Progress is logged every 500 files so a long run over a spinning disk is
+    visibly alive rather than apparently hung.
+    """
+    samples = 1 if quick else ZERO_FILL_SAMPLES
+
+    log.info("Scanning     : %s", ", ".join(str(r) for r in roots))
+    log.info("Extensions   : %s", ", ".join(extensions))
+    log.info("Mode         : %s (%d chunk%s per file)",
+             "quick — header only" if quick else "full sampling",
+             samples, "" if samples == 1 else "s")
+    if newer_than_days is not None:
+        log.info("Window       : files modified in the last %g day(s)", newer_than_days)
+
+    files = find_media_files(roots, extensions, newer_than_days)
+    total = len(files)
+    log.info("Files to check: %d", total)
+    if not total:
+        log.info("Nothing to scan.")
+        return 0
+
+    corrupt: List[Tuple[Path, float, int]] = []
+    suspect: List[Tuple[Path, float, int]] = []
+    started = time.time()
+
+    for index, fpath in enumerate(files, start=1):
+        fraction, header_zeroed, sampled = detect_zero_fill(fpath, samples=samples)
+        verdict = classify_zero_fill(fraction, header_zeroed, sampled)
+
+        if verdict == "corrupt":
+            corrupt.append((fpath, fraction, sampled))
+            log.error("CORRUPT (zero-filled): %s — first 64 KiB is all zeros "
+                      "(%.0f%% of %d sampled chunks zero).",
+                      fpath, fraction * 100, sampled)
+        elif verdict == "suspect":
+            suspect.append((fpath, fraction, sampled))
+            log.warning("SUSPECT (partial zero-fill): %s — %.0f%% of %d sampled "
+                        "chunks are entirely zero.",
+                        fpath, fraction * 100, sampled)
+
+        if index % 500 == 0:
+            elapsed = time.time() - started
+            rate = index / elapsed if elapsed else 0
+            log.info("  … %d/%d checked (%.0f files/s), %d corrupt, %d suspect",
+                     index, total, rate, len(corrupt), len(suspect))
+
+    elapsed = time.time() - started
+    log.info("╔══ Scan complete ══╗")
+    log.info("Checked      : %d files in %.1f s", total, elapsed)
+    log.info("Corrupt      : %d", len(corrupt))
+    log.info("Suspect      : %d", len(suspect))
+
+    if report_path:
+        try:
+            payload = {
+                "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "roots": [str(r) for r in roots],
+                "quick": quick,
+                "newer_than_days": newer_than_days,
+                "files_checked": total,
+                "corrupt": [
+                    {"path": str(p), "zero_fraction": round(f, 4), "sampled": s}
+                    for p, f, s in corrupt
+                ],
+                "suspect": [
+                    {"path": str(p), "zero_fraction": round(f, 4), "sampled": s}
+                    for p, f, s in suspect
+                ],
+            }
+            report_path.write_text(json.dumps(payload, indent=2) + "\n")
+            log.info("Report       : %s", report_path)
+        except OSError as exc:
+            # A scan that found real damage must not be reduced to a failure
+            # just because the report could not be written — the findings are
+            # already in the log above.
+            log.error("Could not write report to %s (%s).", report_path, exc)
+
+    if corrupt:
+        log.error("%d file(s) are zero-filled and not repairable — re-grab them "
+                  "from a different source.", len(corrupt))
+
+    return len(corrupt) + len(suspect)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="aac_dual_audio.py",
+        description=(
+            "Radarr/Sonarr post-processing script that adds an AAC stereo "
+            "track to imported media.\n\n"
+            "Called with no arguments it reads the file path from the *arr "
+            "environment variables, which is how Radarr and Sonarr invoke it. "
+            "--scan is a separate read-only mode for auditing an existing "
+            "library."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--scan",
+        nargs="+",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Scan these directories for zero-filled files and report them. "
+            "Read-only: nothing is transcoded, moved or deleted."
+        ),
+    )
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help=(
+            "Scan mode only: sample just the first 64 KiB of each file. Much "
+            "faster, and still definitive for fully zero-filled files, but "
+            "cannot spot partial zero-fill behind an intact header."
+        ),
+    )
+    parser.add_argument(
+        "--newer-than",
+        type=float,
+        metavar="DAYS",
+        help=(
+            "Scan mode only: check only files modified within the last DAYS "
+            "days. Use this for scheduled scans."
+        ),
+    )
+    parser.add_argument(
+        "--ext",
+        nargs="+",
+        metavar="EXT",
+        help=(
+            "Scan mode only: file extensions to include (without leading dot). "
+            f"Default: {' '.join(e.lstrip('.') for e in SCAN_MEDIA_EXTENSIONS)}"
+        ),
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        metavar="PATH",
+        help="Scan mode only: also write findings to this file as JSON.",
+    )
+    return parser.parse_args(argv)
+
+
 def main() -> None:
+    # No arguments is the *arr post-processing path, and it must stay that way:
+    # Radarr and Sonarr invoke this script bare, with everything in the
+    # environment.  Argument parsing only ever applies to manual invocations.
+    args = parse_args(sys.argv[1:])
+
+    if args.scan:
+        log.info("╔══ AAC Dual-Audio — Zero-Fill Scan ══╗")
+        extensions = (
+            tuple(f".{e.lstrip('.').lower()}" for e in args.ext)
+            if args.ext else SCAN_MEDIA_EXTENSIONS
+        )
+        findings = scan_for_zero_fill(
+            roots=args.scan,
+            extensions=extensions,
+            newer_than_days=args.newer_than,
+            quick=args.quick,
+            report_path=args.report,
+        )
+        # Exit 2 for "scan worked, and found damage", kept distinct from 1 so a
+        # scheduled job can tell a real finding apart from a broken scan.
+        sys.exit(2 if findings else 0)
+
     log.info("╔══ AAC Dual-Audio Post-Processor ══╗")
 
     app_name, file_path = detect_caller()

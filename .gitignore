@@ -27,5 +27,9 @@ Thumbs.db
 .claude/
 CLAUDE.md
 
-# Logs
+# Logs and batch-run output
 *.log
+*.out
+
+# Scan reports (--report)
+*scan*.json
